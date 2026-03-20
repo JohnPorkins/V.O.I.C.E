@@ -235,14 +235,14 @@ def index():
         "<div style='min-height:100vh; display:flex; flex-direction:column; "
         "align-items:center; justify-content:center; gap:12px;'>"
         "<h2 style='margin:0;'>FaceAnalysis Stream</h2>"
-        "<p style='margin:0;'>Open stream: <a style='color:#9ad1ff;' href='/video_feed'>/video_feed</a></p>"
-        "<img src='/video_feed' width='960' style='max-width:95vw; border:1px solid #333;' />"
+        "<p style='margin:0;'>Open stream: <a style='color:#9ad1ff;' href='/stream'>/stream</a></p>"
+        "<img src='/stream' width='960' style='max-width:95vw; border:1px solid #333;' />"
         "</div></body></html>"
     )
 
 
-@app.route("/video_feed")
-def video_feed():
+@app.route("/stream")
+def stream():
     try:
         return Response(
             generate_mjpeg_stream(),
