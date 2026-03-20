@@ -102,7 +102,7 @@ class FaceAnalysis:
         for xmin, ymin, xmax, ymax, confidence in face_boxes:
             self._draw_detection(annotated_frame, xmin, ymin, xmax, ymax, confidence)
         return annotated_frame, detections_data
-
+sadassd
     def _process_with_tasks(self, frame):
         frame_height, frame_width = frame.shape[:2]
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
