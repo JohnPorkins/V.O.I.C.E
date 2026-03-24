@@ -86,7 +86,7 @@ class FaceAnalysis:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self._face_detector.process(rgb_frame)
         detections_data = []
-        annotated_frame = frame.copy()
+        face_boxes = []
 
         if results.detections:
             for detection in results.detections:
@@ -96,8 +96,11 @@ class FaceAnalysis:
                 )
                 confidence = float(detection.score[0]) if detection.score else 0.0
                 detections_data.append((xmin, ymin, xmax, ymax, confidence))
-                self._draw_detection(annotated_frame, xmin, ymin, xmax, ymax, confidence)
+                face_boxes.append((xmin, ymin, xmax, ymax, confidence))
 
+        annotated_frame = frame.copy()
+        for xmin, ymin, xmax, ymax, confidence in face_boxes:
+            self._draw_detection(annotated_frame, xmin, ymin, xmax, ymax, confidence)
         return annotated_frame, detections_data
 
     def _process_with_tasks(self, frame):
@@ -107,7 +110,7 @@ class FaceAnalysis:
         result = self._face_detector.detect(mp_image)
 
         detections_data = []
-        annotated_frame = frame.copy()
+        face_boxes = []
 
         for detection in result.detections:
             bbox = detection.bounding_box
@@ -121,8 +124,11 @@ class FaceAnalysis:
                 else 0.0
             )
             detections_data.append((xmin, ymin, xmax, ymax, confidence))
-            self._draw_detection(annotated_frame, xmin, ymin, xmax, ymax, confidence)
+            face_boxes.append((xmin, ymin, xmax, ymax, confidence))
 
+        annotated_frame = frame.copy()
+        for xmin, ymin, xmax, ymax, confidence in face_boxes:
+            self._draw_detection(annotated_frame, xmin, ymin, xmax, ymax, confidence)
         return annotated_frame, detections_data
 
     @staticmethod
@@ -212,14 +218,20 @@ def generate_mjpeg_stream():
 @app.route("/")
 def index():
     return (
-        "<h2>FaceAnalysis Stream</h2>"
-        "<p>Open stream: <a href='/video_feed'>/video_feed</a></p>"
-        "<img src='/video_feed' width='960' />"
+        "<!doctype html>"
+        "<html><head><meta charset='utf-8'><title>FaceAnalysis Stream</title></head>"
+        "<body style='margin:0; background:#000; color:#fff; font-family:Arial,sans-serif;'>"
+        "<div style='min-height:100vh; display:flex; flex-direction:column; "
+        "align-items:center; justify-content:center; gap:12px;'>"
+        "<h2 style='margin:0;'>FaceAnalysis Stream</h2>"
+        "<p style='margin:0;'>Open stream: <a style='color:#9ad1ff;' href='/stream'>/stream</a></p>"
+        "<img src='/stream' width='960' style='max-width:95vw; border:1px solid #333;' />"
+        "</div></body></html>"
     )
 
 
-@app.route("/video_feed")
-def video_feed():
+@app.route("/stream")
+def stream():
     try:
         return Response(
             generate_mjpeg_stream(),
