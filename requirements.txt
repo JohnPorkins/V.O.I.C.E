@@ -1,4 +1,5 @@
 opencv-python
 mediapipe
 flask
-sqlite3
+flask-sock
+websocket-client
