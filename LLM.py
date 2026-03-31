@@ -20,6 +20,40 @@ try:
 except Exception:  # pragma: no cover
     InsightFaceAnalysis = None
 
+
+def _load_env_from_dotenv() -> None:
+    """
+    Мини-замена python-dotenv: читает переменные из ".env" рядом с файлом.
+    Поддерживает формат: KEY=value (комментарии/пустые строки игнорируются).
+    """
+    dotenv_path = Path(__file__).resolve().parent / ".env"
+    if not dotenv_path.exists():
+        return
+    try:
+        text = dotenv_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if not key or not val:
+            continue
+        # Поддерживаем как OPENAI_API_KEY=..., так и api_key=...
+        if key == "api_key" and "OPENAI_API_KEY" not in os.environ:
+            os.environ["OPENAI_API_KEY"] = val
+        if key not in os.environ:
+            os.environ[key] = val
+
+
+_load_env_from_dotenv()
+
 class FaceAnalysis:
     """
     Крок 1 ТЗ: Face Detection (MediaPipe Face Detection / BlazeFace short-range TFLite).
@@ -1377,6 +1411,7 @@ INDEX_HTML = """<!doctype html>
   .video-box img { display:block; width:100%; height:auto; vertical-align:middle; }
   button.toggle { align-self:flex-start; padding:10px 16px; border-radius:8px; border:1px solid #3d4a5c; background:#1a2332; color:#e8eaed; cursor:pointer; font-size:0.95rem; }
   button.toggle:hover { background:#243044; }
+button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
   .details { display:none; flex-direction:column; gap:8px; }
   .details.visible { display:flex; }
   .details pre { margin:0; padding:10px; background:#11161d; border:1px solid #2a3340; border-radius:8px; font-size:11px; line-height:1.35; max-height:220px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
@@ -1411,6 +1446,7 @@ INDEX_HTML = """<!doctype html>
       <h2>Диалог (OpenAI Realtime)</h2>
       <div id="chatLog"></div>
     </div>
+    <button type="button" class="toggle" id="btnMic">Разрешить микрофон и начать разговор</button>
     <p class="hint">Микрофон: разрешите доступ в браузере. Нужны переменные окружения OPENAI_API_KEY на сервере и пакеты flask-sock, websocket-client.</p>
   </div>
 </div>
@@ -1418,11 +1454,14 @@ INDEX_HTML = """<!doctype html>
 (function(){
   const details = document.getElementById('detailsPanel');
   const btn = document.getElementById('btnDetails');
+  const btnMic = document.getElementById('btnMic');
   const visionJson = document.getElementById('visionJson');
   const chatLog = document.getElementById('chatLog');
   const wsHint = document.getElementById('wsHint');
   let pollId = null;
   let detailsOn = false;
+  let micStarted = false;
+  let micPending = false;
 
   function logLine(cls, text) {
     const d = document.createElement('div');
@@ -1447,6 +1486,18 @@ INDEX_HTML = """<!doctype html>
       pollId = null;
     }
   });
+
+  if (btnMic) {
+    btnMic.addEventListener('click', function() {
+      const isRealtimeOpen = !!realtime && realtime.readyState === WebSocket.OPEN;
+      micPending = !isRealtimeOpen;
+      wsHint.textContent = isRealtimeOpen
+        ? 'Микрофон: запрошен'
+        : 'Микрофон: запрошен, ждём подключение Realtime...';
+      startMic();
+      btnMic.disabled = true;
+    });
+  }
 
   const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = wsProto + '//' + location.host + '/ws/realtime';
@@ -1476,7 +1527,6 @@ INDEX_HTML = """<!doctype html>
     }
     realtime.addEventListener('open', function() {
       wsHint.textContent = 'Realtime: подключено';
-      logLine('msg-sys', '[Система] Сессия Realtime открыта. Говорите в микрофон.');
       realtime.send(JSON.stringify({
         type: 'session.update',
         session: {
@@ -1485,10 +1535,14 @@ INDEX_HTML = """<!doctype html>
           voice: 'alloy',
           input_audio_format: 'pcm16',
           output_audio_format: 'pcm16',
-          turn_detection: { type: 'server_vad' }
+          turn_detection: { type: 'server_vad', create_response: true }
         }
       }));
-      startMic();
+      if (micPending) {
+        startMic();
+        if (btnMic) btnMic.disabled = true;
+        micPending = false;
+      }
     });
     realtime.addEventListener('message', function(ev) {
       let data = ev.data;
@@ -1534,6 +1588,8 @@ INDEX_HTML = """<!doctype html>
   }
 
   function startMic() {
+    if (micStarted) return;
+    micStarted = true;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       logLine('msg-sys', 'getUserMedia не поддерживается');
       return;
@@ -1632,7 +1688,19 @@ try:
         api_key = os.environ.get("OPENAI_API_KEY", "")
         if not api_key:
             try:
-                ws.send(json.dumps({"type": "error", "error": {"message": "Set OPENAI_API_KEY"}}))
+                dotenv_hint = str((Path(__file__).resolve().parent / ".env").resolve())
+                ws.send(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "error": {
+                                "message": "OPENAI_API_KEY is not set (also checked .env).",
+                                "dotenv_hint": dotenv_hint,
+                                "expected_format": "OPENAI_API_KEY=your_key_here",
+                            },
+                        }
+                    )
+                )
             except Exception:
                 pass
             return

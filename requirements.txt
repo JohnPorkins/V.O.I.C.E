@@ -1,3 +1,5 @@
+# На Windows + Python 3.13 numpy 2.4.x иногда даёт DLL load failed для _multiarray_umath — держим <2.4
+numpy>=2.2,<2.4
 opencv-python
 mediapipe
 flask
