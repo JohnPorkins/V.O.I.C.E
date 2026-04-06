@@ -10,6 +10,17 @@ import sqlite3
 import threading
 from typing import Any, Dict, List, Tuple, Optional, Set, Union
 import numpy as np
+
+try:
+    import serial
+except ImportError:
+    serial = None
+
+import math
+
+foxglove_current_frame = None
+latest_scan = [0] * 360
+
 try:
     import sounddevice as sd
 except Exception:  # pragma: no cover
@@ -1094,6 +1105,82 @@ def analyze_frame_full_pipeline(
     }
 
 
+def lidar_thread():
+    global latest_scan
+    if serial is None: return
+    BAUDRATE = 230400
+    port_candidates = ["/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyAMA10"]
+    ser = None
+    for p in port_candidates:
+        try:
+            print("Trying", p)
+            ser = serial.Serial(p, BAUDRATE, timeout=1)
+            print(f"LiDAR connected on {p}")
+            break
+        except: continue
+    if not ser: return
+    
+    buffer = bytearray()
+    scan_data = [0] * 360
+    last_angle = 0.0
+    while True:
+        try:
+            if ser.in_waiting:
+                buffer.extend(ser.read(ser.in_waiting))
+                while len(buffer) >= 47:
+                    if buffer[0] == 0x54 and buffer[1] == 0x2C:
+                        packet = buffer[:47]; del buffer[:47]
+                        start_angle = (packet[4] + packet[5] * 256) / 100.0
+                        if start_angle > 360: continue
+                        if start_angle < last_angle - 180:
+                            latest_scan = scan_data.copy()
+                            scan_data = [0] * 360
+                        for i in range(12):
+                            dist = packet[6 + i*3] + packet[7 + i*3] * 256
+                            if 50 < dist < 8000:
+                                scan_data[int((start_angle + i * 0.3) % 360)] = dist
+                        last_angle = start_angle
+                    else: del buffer[0:1]
+            time.sleep(0.01)
+        except: time.sleep(1)
+
+RADAR_MAX_DIST = 4000
+CAMERA_FOV = 60
+
+def draw_radar_map(scan, target_angle=None, target_dist=None):
+    size = 400
+    center = (size // 2, size // 2)
+    scale = (size / 2) / RADAR_MAX_DIST
+    radar_img = np.zeros((size, size, 3), dtype=np.uint8)
+    
+    for r in [1000, 2000, 3000, 4000]:
+        r_px = int(r * scale)
+        cv2.circle(radar_img, center, r_px, (40, 40, 40), 1)
+        
+    fov_half = CAMERA_FOV / 2.0
+    cv2.ellipse(radar_img, center, (int(RADAR_MAX_DIST*scale), int(RADAR_MAX_DIST*scale)),
+                -90, -fov_half, fov_half, (20, 20, 60), -1)
+                
+    cv2.line(radar_img, center, (center[0], 0), (0, 255, 0), 2)
+    
+    for angle in range(360):
+        try:
+            dist = scan[angle]
+            if 50 < dist < RADAR_MAX_DIST:
+                rad = math.radians(angle - 90)
+                x = int(center[0] + dist * scale * math.cos(rad))
+                y = int(center[1] + dist * scale * math.sin(rad))
+                cv2.circle(radar_img, (x, y), 2, (255, 255, 255), -1)
+        except:
+            continue
+            
+    if target_angle is not None and target_dist is not None and target_dist > 0:
+        rad = math.radians(target_angle - 90)
+        x = int(center[0] + target_dist * scale * math.cos(rad))
+        y = int(center[1] + target_dist * scale * math.sin(rad))
+    cv2.circle(radar_img, center, 8, (0, 255, 255), -1)
+    return radar_img
+
 app = Flask(__name__)
 
 cap = None
@@ -1311,7 +1398,15 @@ def _camera_worker_loop() -> None:
             "faces": faces_snapshots,
         }
 
+        radar = draw_radar_map(latest_scan, target_angle=None)
+        fox_image = raw_copy.copy()
+        combined = np.hstack((cv2.resize(fox_image, (400, 400)), radar))
+        ok, enc_combined = cv2.imencode(".jpg", combined)
+
         with _frame_lock:
+            if ok:
+                global foxglove_current_frame
+                foxglove_current_frame = enc_combined.tobytes()
             _latest_raw_frame = raw_copy
             _latest_overlay_frame = annotated_frame
             _vision_snapshot = snap
@@ -1403,12 +1498,12 @@ INDEX_HTML = """<!doctype html>
 <style>
   * { box-sizing: border-box; }
   body { margin:0; background:#0d0f12; color:#e8eaed; font-family:Segoe UI, Roboto, Arial, sans-serif; min-height:100vh; }
-  .wrap { display:flex; flex-wrap:wrap; min-height:100vh; max-width:1400px; margin:0 auto; padding:12px; gap:16px; }
-  .left { flex:1 1 420px; display:flex; flex-direction:column; gap:10px; }
-  .right { flex:1 1 360px; min-width:280px; display:flex; flex-direction:column; gap:8px; }
+  .wrap { display:grid; grid-template-columns: 1.5fr 1fr; min-height:100vh; max-width:1800px; width:100%; margin:0 auto; padding:20px; gap:20px; }
+  .left { display:flex; flex-direction:column; gap:10px; }
+  .right { background: #0a0b10; border: 1px solid #111; padding: 20px; display: flex; flex-direction: column; border-radius: 8px; }
   h1 { font-size:1.1rem; margin:0 0 4px 0; font-weight:600; color:#9ad1ff; }
-  .video-box { background:#000; border:1px solid #2a3340; border-radius:8px; overflow:hidden; }
-  .video-box img { display:block; width:100%; height:auto; vertical-align:middle; }
+  .video-box { background:#000; border:1px solid #1a1f26; border-radius:8px; overflow:hidden; }
+  .video-box img { display:block; width:auto; height: 600px ; vertical-align:middle; object-fit:cover; }
   button.toggle { align-self:flex-start; padding:10px 16px; border-radius:8px; border:1px solid #3d4a5c; background:#1a2332; color:#e8eaed; cursor:pointer; font-size:0.95rem; }
   button.toggle:hover { background:#243044; }
 button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
@@ -1416,12 +1511,15 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
   .details.visible { display:flex; }
   .details pre { margin:0; padding:10px; background:#11161d; border:1px solid #2a3340; border-radius:8px; font-size:11px; line-height:1.35; max-height:220px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
   .details .ov { margin-top:4px; }
-  .chat-panel { flex:1; display:flex; flex-direction:column; min-height:320px; background:#11161d; border:1px solid #2a3340; border-radius:8px; overflow:hidden; }
-  .chat-panel h2 { margin:0; padding:10px 12px; font-size:0.95rem; border-bottom:1px solid #2a3340; background:#151b24; }
-  #chatLog { flex:1; overflow-y:auto; padding:12px; font-size:0.9rem; line-height:1.45; }
-  .msg-user { color:#7dd3fc; margin:6px 0; }
-  .msg-agent { color:#a7f3d0; margin:6px 0; }
-  .msg-sys { color:#94a3b8; font-size:0.85rem; margin:6px 0; }
+  .title-bar { border-bottom: 1px solid #008800; padding-bottom: 10px; margin-bottom: 15px; }
+  .title-bar h3 { margin: 0; font-size: 1.17em; color: #00ff00; text-transform: uppercase; font-family: sans-serif; }
+  .chat-box { flex-grow: 1; overflow-y: auto; padding-right: 10px; font-family: 'Courier New', monospace; min-height: 320px; }
+  .message { margin-bottom: 12px; border-bottom: 1px solid #111; padding-bottom: 8px; }
+  .role { font-weight: bold; color: #00ffaa; font-size: 0.9em; }
+  .text { color: #ccc; font-size: 0.95em; margin-top: 2px; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: #000; }
+  ::-webkit-scrollbar-thumb { background: #003300; }
   .hint { font-size:0.8rem; color:#64748b; padding:0 4px; }
 </style>
 </head>
@@ -1432,60 +1530,35 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
     <div class="video-box">
       <img src="/stream" alt="video"/>
     </div>
-    <button type="button" class="toggle" id="btnDetails">Показать детали анализа</button>
+    <div style="display: flex; justify-content: space-around; margin-top: 15px;">
+       <a href="/overlay" target="_blank" style="text-decoration:none; text-align:center; color:#5e35b1; font-weight:500;">Камера с данными</a>
+       <a href="/foxglove" target="_blank" style="text-decoration:none; text-align:center; color:#5e35b1; font-weight:500;">Foxglove SLAM</a>
+    </div>
     <p class="hint" id="wsHint"></p>
-    <div class="details" id="detailsPanel">
-      <pre id="visionJson">Загрузка…</pre>
-      <div class="video-box ov">
-        <img id="overlayImg" src="/stream_overlay" alt="overlay"/>
-      </div>
-    </div>
   </div>
-  <div class="right">
-    <div class="chat-panel">
-      <h2>Диалог (OpenAI Realtime)</h2>
-      <div id="chatLog"></div>
-    </div>
-    <button type="button" class="toggle" id="btnMic">Разрешить микрофон и начать разговор</button>
+  <div class="right sidebar">
+    <div class="title-bar"><h3>ЛОГ_ДІАЛОГУ</h3></div>
+    <div id="chatLog" class="chat-box"></div>
+    <button type="button" class="toggle" style="margin-top: 10px;" id="btnMic">Разрешить микрофон и начать разговор</button>
     <p class="hint">Микрофон: разрешите доступ в браузере. Нужны переменные окружения OPENAI_API_KEY на сервере и пакеты flask-sock, websocket-client.</p>
   </div>
 </div>
 <script>
 (function(){
-  const details = document.getElementById('detailsPanel');
-  const btn = document.getElementById('btnDetails');
   const btnMic = document.getElementById('btnMic');
-  const visionJson = document.getElementById('visionJson');
   const chatLog = document.getElementById('chatLog');
   const wsHint = document.getElementById('wsHint');
-  let pollId = null;
-  let detailsOn = false;
   let micStarted = false;
   let micPending = false;
 
-  function logLine(cls, text) {
+  function logLine(role, text) {
     const d = document.createElement('div');
-    d.className = cls;
-    d.textContent = text;
+    d.className = 'message';
+    d.innerHTML = '<div class="role">[' + role + ']</div><div class="text"></div>';
+    d.querySelector('.text').textContent = text;
     chatLog.appendChild(d);
     chatLog.scrollTop = chatLog.scrollHeight;
   }
-
-  btn.addEventListener('click', function() {
-    detailsOn = !detailsOn;
-    details.classList.toggle('visible', detailsOn);
-    btn.textContent = detailsOn ? 'Скрыть детали анализа' : 'Показать детали анализа';
-    if (detailsOn) {
-      pollId = setInterval(function() {
-        fetch('/api/vision_state').then(function(r){ return r.json(); }).then(function(j){
-          visionJson.textContent = JSON.stringify(j, null, 2);
-        }).catch(function(){ visionJson.textContent = 'Ошибка /api/vision_state'; });
-      }, 250);
-    } else {
-      if (pollId) clearInterval(pollId);
-      pollId = null;
-    }
-  });
 
   if (btnMic) {
     btnMic.addEventListener('click', function() {
@@ -1504,13 +1577,15 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
   let realtime = null;
 
   function appendAgentDelta(t) {
-    let last = chatLog.querySelector('.msg-agent.last');
-    if (!last) {
-      last = document.createElement('div');
-      last.className = 'msg-agent last';
-      chatLog.appendChild(last);
+    let lastMsg = chatLog.querySelector('.msg-agent.last');
+    if (!lastMsg) {
+      lastMsg = document.createElement('div');
+      lastMsg.className = 'message msg-agent last';
+      lastMsg.innerHTML = '<div class="role">[M141]</div><div class="text"></div>';
+      chatLog.appendChild(lastMsg);
     }
-    last.textContent = (last.textContent || '') + (t || '');
+    const textDiv = lastMsg.querySelector('.text');
+    textDiv.textContent = (textDiv.textContent || '') + (t || '');
     chatLog.scrollTop = chatLog.scrollHeight;
   }
   function finishAgentTurn() {
@@ -1557,9 +1632,9 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
       } else if (t === 'response.audio_transcript.done' || t === 'response.done') {
         finishAgentTurn();
       } else if (t === 'conversation.item.input_audio_transcription.completed' && o.transcript) {
-        logLine('msg-user', 'Вы: ' + o.transcript);
+        logLine('You', o.transcript);
       } else if (t === 'error') {
-        logLine('msg-sys', 'Ошибка: ' + JSON.stringify(o.error || o));
+        logLine('Sys', 'Ошибка: ' + JSON.stringify(o.error || o));
       }
     });
     realtime.addEventListener('close', function() {
@@ -1635,6 +1710,21 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
 @app.route("/")
 def index():
     return render_template_string(INDEX_HTML)
+
+@app.route("/overlay")
+def overlay_index(): return '<html><body style="display:flex; justify-content:center; align-items:center; height:100vh; background:#111; margin:0;"><img src="/stream_overlay" style="max-height:100vh; max-width:100vw;"></body></html>'
+
+@app.route("/foxglove")
+def foxglove_index(): return '<html><body style="display:flex; justify-content:center; align-items:center; height:100vh; background:#111; margin:0;"><img src="/foxglove/video_feed" style="max-height:100vh; max-width:100vw;"></body></html>'
+
+@app.route("/foxglove/video_feed")
+def foxglove_video_feed():
+    def gen():
+        while True:
+            if foxglove_current_frame:
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + foxglove_current_frame + b'\r\n')
+            time.sleep(0.1)
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.route("/api/vision_state")
@@ -1788,6 +1878,7 @@ except ImportError:
 
 
 if __name__ == "__main__":
+    threading.Thread(target=lidar_thread, daemon=True).start()
     try:
         app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
     finally:
