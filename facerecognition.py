@@ -155,7 +155,7 @@ app = Flask(__name__)
 
 cap = None
 face_analysis = None
-TARGET_FPS = 15
+TARGET_FPS = 5
 
 
 def _open_first_available_camera(max_index: int = 3):
@@ -173,7 +173,7 @@ def _open_first_available_camera(max_index: int = 3):
 def _ensure_pipeline_initialized():
     global cap, face_analysis
     if face_analysis is None:
-        face_analysis = FaceAnalysis(min_detection_confidence=0.5, model_selection=0)
+        face_analysis = FaceAnalysis(min_detection_confidence=0.8, model_selection=0)
     if cap is None or not cap.isOpened():
         cap, camera_idx = _open_first_available_camera(max_index=3)
         if cap is None:
