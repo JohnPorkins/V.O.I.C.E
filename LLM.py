@@ -1608,6 +1608,32 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
   const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = wsProto + '//' + location.host + '/ws/realtime';
   let realtime = null;
+  let holdAssistantUntilUserTranscript = false;
+  const bufferedAssistantDeltas = [];
+  let assistantTurnEndPending = false;
+
+  function queueOrAppendAgentDelta(chunk) {
+    if (!chunk) return;
+    if (holdAssistantUntilUserTranscript) {
+      bufferedAssistantDeltas.push(chunk);
+    } else {
+      appendAgentDelta(chunk);
+    }
+  }
+  function flushBufferedAssistantDeltas() {
+    if (!bufferedAssistantDeltas.length) return;
+    const merged = bufferedAssistantDeltas.join('');
+    bufferedAssistantDeltas.length = 0;
+    appendAgentDelta(merged);
+  }
+  function releaseAssistantAfterUserTranscript() {
+    holdAssistantUntilUserTranscript = false;
+    flushBufferedAssistantDeltas();
+    if (assistantTurnEndPending) {
+      assistantTurnEndPending = false;
+      finishAgentTurn();
+    }
+  }
 
   function refreshDetectedUser() {
     fetch('/api/vision_state', { cache: 'no-store' }).then(function(res) {
@@ -1691,7 +1717,10 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
   function finalizeUserTurn(userLabel, transcript) {
     const label = String(userLabel || 'user_011').trim() || 'user_011';
     const clean = String(transcript || '').trim();
-    if (!clean) return;
+    if (!clean) {
+      releaseAssistantAfterUserTranscript();
+      return;
+    }
     let lastMsg = chatLog.querySelector('.msg-user.last');
     if (lastMsg) {
       const textDiv = lastMsg.querySelector('.text');
@@ -1706,6 +1735,7 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
       addConversationLine(label, clean);
     }
     chatLog.scrollTop = chatLog.scrollHeight;
+    releaseAssistantAfterUserTranscript();
   }
   function finishAgentTurn() {
     const last = chatLog.querySelector('.msg-agent.last');
@@ -1746,16 +1776,31 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
       let o;
       try { o = JSON.parse(data); } catch (e) { return; }
       const t = o.type || '';
-      if (t === 'response.audio_transcript.delta' && o.delta) {
-        appendAgentDelta(o.delta);
+      if (t === 'input_audio_buffer.speech_started') {
+        holdAssistantUntilUserTranscript = true;
+        assistantTurnEndPending = false;
+      } else if (t === 'response.audio_transcript.delta' && o.delta) {
+        queueOrAppendAgentDelta(o.delta);
       } else if (t === 'response.text.delta' && o.delta) {
-        appendAgentDelta(o.delta);
+        queueOrAppendAgentDelta(o.delta);
       } else if (t === 'response.audio_transcript.done' || t === 'response.done') {
-        finishAgentTurn();
+        if (holdAssistantUntilUserTranscript) {
+          assistantTurnEndPending = true;
+        } else {
+          finishAgentTurn();
+        }
       } else if (t === 'conversation.item.input_audio_transcription.delta' && o.delta) {
+        holdAssistantUntilUserTranscript = true;
         appendUserDelta(currentDetectedUser, o.delta);
-      } else if (t === 'conversation.item.input_audio_transcription.completed' && o.transcript) {
-        finalizeUserTurn(currentDetectedUser, o.transcript);
+      } else if (t === 'conversation.item.input_audio_transcription.completed') {
+        const tr = o.transcript != null ? String(o.transcript).trim() : '';
+        if (tr) {
+          finalizeUserTurn(currentDetectedUser, o.transcript);
+        } else {
+          releaseAssistantAfterUserTranscript();
+        }
+      } else if (t === 'conversation.item.input_audio_transcription.failed') {
+        releaseAssistantAfterUserTranscript();
       } else if (t === 'error') {
         logLine('Sys', 'Ошибка: ' + JSON.stringify(o.error || o));
       }
