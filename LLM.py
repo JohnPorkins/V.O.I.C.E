@@ -1,6 +1,6 @@
 import cv2
 import mediapipe as mp
-from flask import Flask, Response, render_template_string, request
+from flask import Flask, Response, render_template_string
 from pathlib import Path
 from urllib.request import urlretrieve
 import json
@@ -545,27 +545,7 @@ def _match_landmarks_to_detection(
 # Простые "user embeddings"
 # ----------------------------
 
-from embedding_db import (
-    CHAR_TABLE,
-    EMBEDDING_DB_PATH,
-    build_facts_instructions_block,
-    facts_for_query,
-    init_embedding_db,
-    normalize_user_name,
-)
-
-REALTIME_BASE_INSTRUCTIONS = (
-    "Ти дружелюбний ассистент. Запам'ятай, що ти є в першу чергу українським ассистентом "
-    "і повинен відповідати українською мовою. Також ти повинен максимально відповідати "
-    "та розмовляти українською мовою, як звичайна людина."
-)
-
-
-def merge_realtime_instructions(query: str = "") -> str:
-    facts = build_facts_instructions_block(query)
-    if facts:
-        return REALTIME_BASE_INSTRUCTIONS + "\n\n" + facts
-    return REALTIME_BASE_INSTRUCTIONS
+EMBEDDING_DB_PATH = Path(__file__).resolve().parent / "embeddings.db"
 
 # embedding считается как вектор по выровненному лицу.
 # Важно: это не нейросетевой face embedding (в репозитории нет модели),
@@ -588,9 +568,6 @@ EMBEDDING_EMA_MOMENTUM = 0.98
 VOICE_SAMPLE_SECONDS = 2.0
 VOICE_SAMPLE_RATE = 16000
 VOICE_EMBEDDING_DIM = 256
-
-# Новий невідомий користувач потрапляє в БД лише після стільки секунд безперервної присутності в кадрі.
-NEW_USER_MIN_VISIBLE_SEC = 2.0
 
 # InsightFace model init is heavy, so we create it lazily.
 _insightface_app = None
@@ -710,7 +687,7 @@ def _record_voice_embedding() -> Optional[np.ndarray]:
 
 
 class EmbeddingsDB:
-    """Хранит face/voice embedding’и в char_embeddings (user_001, user_002, ...)."""
+    """Хранит embedding’и пользователей в SQLite и выдаёт user_1, user_2, ..."""
 
     def __init__(
         self,
@@ -726,7 +703,17 @@ class EmbeddingsDB:
 
         with self._conn:
             self._conn.execute("PRAGMA journal_mode=WAL;")
-            init_embedding_db(self._conn)
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    user_name TEXT PRIMARY KEY,
+                    face_embedding BLOB NOT NULL,
+                    voice_embedding BLOB,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            self._ensure_schema_compatibility()
 
         # В памяти держим embedding на пользователя.
         self._known: Dict[str, np.ndarray] = {}
@@ -745,16 +732,38 @@ class EmbeddingsDB:
             )
         return vec
 
+    def _ensure_schema_compatibility(self) -> None:
+        """Мягкая миграция старой схемы (embedding -> face_embedding)."""
+        cols = self._conn.execute("PRAGMA table_info(embeddings)").fetchall()
+        col_names = {row[1] for row in cols}
+
+        if "face_embedding" not in col_names:
+            self._conn.execute("ALTER TABLE embeddings ADD COLUMN face_embedding BLOB")
+            if "embedding" in col_names:
+                self._conn.execute(
+                    "UPDATE embeddings SET face_embedding = embedding WHERE face_embedding IS NULL"
+                )
+
+        if "voice_embedding" not in col_names:
+            self._conn.execute("ALTER TABLE embeddings ADD COLUMN voice_embedding BLOB")
+
     def _load_known_embeddings(self) -> None:
         with self._lock, self._conn:
-            rows = self._conn.execute(
-                f"SELECT user_name, face_embedding FROM {CHAR_TABLE}"
-            ).fetchall()
+            cols = self._conn.execute("PRAGMA table_info(embeddings)").fetchall()
+            col_names = {row[1] for row in cols}
+            if "face_embedding" in col_names:
+                rows = self._conn.execute(
+                    "SELECT user_name, face_embedding FROM embeddings"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT user_name, embedding FROM embeddings"
+                ).fetchall()
 
         known: Dict[str, np.ndarray] = {}
         for user_name, blob in rows:
             try:
-                known[normalize_user_name(user_name)] = self._deserialize_embedding(blob)
+                known[user_name] = self._deserialize_embedding(blob)
             except Exception:
                 continue
 
@@ -788,27 +797,39 @@ class EmbeddingsDB:
 
         return best_name, best_sim, second_name, second_sim
 
-    def match_known_user(self, embedding_vec: np.ndarray) -> Optional[str]:
-        """Повертає ім'я з БД, якщо схожість ≥ порога; інакше None (без створення нового)."""
+    def get_or_create_user_name(
+        self, embedding_vec: np.ndarray, voice_embedding_vec: Optional[np.ndarray] = None
+    ) -> Tuple[str, bool]:
         with self._lock:
             if not self._known:
-                return None
-            best_name, best_sim, _, _ = self._get_best_two_matches(embedding_vec)
-            if best_name is not None and best_sim >= self._similarity_threshold:
-                return best_name
-            return None
+                user_name = f"user_{self._next_user_id}"
+                self._next_user_id += 1
+                self._known[user_name] = embedding_vec
+                with self._conn:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO embeddings (user_name, face_embedding, voice_embedding, created_at) VALUES (?, ?, ?, ?)",
+                        (
+                            user_name,
+                            self._serialize_embedding(embedding_vec),
+                            self._serialize_embedding(voice_embedding_vec)
+                            if voice_embedding_vec is not None
+                            else None,
+                            time.time(),
+                        ),
+                    )
+                return user_name, True
 
-    def register_new_user(
-        self, embedding_vec: np.ndarray, voice_embedding_vec: Optional[np.ndarray] = None
-    ) -> str:
-        """Завжди додає нового user_N у БД та в _known."""
-        with self._lock:
-            user_name = f"user_{self._next_user_id:03d}"
+            best_name, best_sim, second_name, second_sim = self._get_best_two_matches(embedding_vec)
+            # Как в ultv1.py: достаточно лучшего совпадения выше порога.
+            if best_name is not None and best_sim >= self._similarity_threshold:
+                return best_name, False
+
+            user_name = f"user_{self._next_user_id}"
             self._next_user_id += 1
             self._known[user_name] = embedding_vec
             with self._conn:
                 self._conn.execute(
-                    f"INSERT OR REPLACE INTO {CHAR_TABLE} (user_name, face_embedding, voice_embedding, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO embeddings (user_name, face_embedding, voice_embedding, created_at) VALUES (?, ?, ?, ?)",
                     (
                         user_name,
                         self._serialize_embedding(embedding_vec),
@@ -818,25 +839,13 @@ class EmbeddingsDB:
                         time.time(),
                     ),
                 )
-            return user_name
-
-    def get_or_create_user_name(
-        self, embedding_vec: np.ndarray, voice_embedding_vec: Optional[np.ndarray] = None
-    ) -> Tuple[str, bool]:
-        matched = self.match_known_user(embedding_vec)
-        if matched is not None:
-            return matched, False
-        user_name = self.register_new_user(embedding_vec, voice_embedding_vec)
-        return user_name, True
+            return user_name, True
 
     def set_voice_embedding(self, user_name: str, voice_embedding_vec: np.ndarray) -> None:
         with self._lock, self._conn:
             self._conn.execute(
-                f"UPDATE {CHAR_TABLE} SET voice_embedding = ? WHERE user_name = ?",
-                (
-                    self._serialize_embedding(voice_embedding_vec),
-                    normalize_user_name(user_name),
-                ),
+                "UPDATE embeddings SET voice_embedding = ? WHERE user_name = ?",
+                (self._serialize_embedding(voice_embedding_vec), user_name),
             )
 
     def close(self) -> None:
@@ -1056,20 +1065,15 @@ cap = None
 face_analysis = None
 face_alignment = None
 head_pose = HeadPoseEstimator(refine=True)
-TARGET_FPS = 5
+TARGET_FPS = 15
 embeddings_db: Optional[EmbeddingsDB] = None
 
 # Shared camera: один worker пишет кадры и JSON-снимок; MJPEG-генераторы только читают.
 _frame_lock = threading.Lock()
 _latest_raw_frame: Optional[np.ndarray] = None
 _latest_overlay_frame: Optional[np.ndarray] = None
-_latest_raw_jpeg: Optional[bytes] = None
-_latest_overlay_jpeg: Optional[bytes] = None
 _vision_snapshot: Dict[str, Any] = {}
 _camera_worker_started = False
-# face_index -> perf_counter, коли вперше побачили обличчя без матчу в БД (очікуємо NEW_USER_MIN_VISIBLE_SEC).
-_pending_new_user_since: Dict[int, float] = {}
-CONVERSATION_LOG_DIR = Path(__file__).resolve().parent / "conversation_logs"
 
 OPENAI_REALTIME_MODEL = os.environ.get(
     "OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview"
@@ -1109,8 +1113,7 @@ def _start_camera_worker() -> None:
 
 
 def _camera_worker_loop() -> None:
-    global _latest_raw_frame, _latest_overlay_frame, _latest_raw_jpeg, _latest_overlay_jpeg, _vision_snapshot
-    global _pending_new_user_since
+    global _latest_raw_frame, _latest_overlay_frame, _vision_snapshot
     _ensure_pipeline_initialized()
     frame_interval = 1.0 / TARGET_FPS
     next_frame_time = time.perf_counter()
@@ -1126,13 +1129,6 @@ def _camera_worker_loop() -> None:
             continue
 
         raw_copy = frame.copy()
-        ok_raw, enc_raw = cv2.imencode(".jpg", raw_copy)
-        # Publish raw frame immediately to minimize stream latency.
-        with _frame_lock:
-            _latest_raw_frame = raw_copy
-            if ok_raw:
-                _latest_raw_jpeg = enc_raw.tobytes()
-
         annotated_frame, detections = face_analysis.process_frame(frame)
         faces_snapshots: List[Dict[str, Any]] = []
 
@@ -1165,24 +1161,17 @@ def _camera_worker_loop() -> None:
                     )
                     embedding_vec = _compute_embedding_from_aligned(aligned_for_embedding)
                     assert embeddings_db is not None
-                    matched = embeddings_db.match_known_user(embedding_vec)
-                    if matched is not None:
-                        assigned_user_name = matched
-                        _pending_new_user_since.pop(fi, None)
-                    else:
-                        now_mono = time.perf_counter()
-                        if fi not in _pending_new_user_since:
-                            _pending_new_user_since[fi] = now_mono
-                        if now_mono - _pending_new_user_since[fi] >= NEW_USER_MIN_VISIBLE_SEC:
-                            assigned_user_name = embeddings_db.register_new_user(embedding_vec)
-                            _pending_new_user_since.pop(fi, None)
-                            voice_embedding_vec = _record_voice_embedding()
-                            if voice_embedding_vec is not None:
-                                embeddings_db.set_voice_embedding(
-                                    assigned_user_name, voice_embedding_vec
-                                )
-                                print(f"[voice] saved for {assigned_user_name}")
-                            print(f"[embeddings] created {assigned_user_name} (after {NEW_USER_MIN_VISIBLE_SEC:g}s in frame)")
+                    assigned_user_name, is_new_user = embeddings_db.get_or_create_user_name(
+                        embedding_vec
+                    )
+                    if is_new_user:
+                        voice_embedding_vec = _record_voice_embedding()
+                        if voice_embedding_vec is not None:
+                            embeddings_db.set_voice_embedding(
+                                assigned_user_name, voice_embedding_vec
+                            )
+                            print(f"[voice] saved for {assigned_user_name}")
+                        print(f"[embeddings] created {assigned_user_name}")
                 except Exception as exc:
                     print(f"[embeddings] failed for face {fi}: {exc}")
 
@@ -1254,10 +1243,6 @@ def _camera_worker_loop() -> None:
                         "head_ok": facing_head,
                     }
                 )
-            n_faces = len(faces_lms)
-            for _fi_pending in list(_pending_new_user_since.keys()):
-                if _fi_pending >= n_faces:
-                    del _pending_new_user_since[_fi_pending]
         except Exception as exc:
             print(f"[head_pose] {exc}")
 
@@ -1274,15 +1259,13 @@ def _camera_worker_loop() -> None:
         fox_image = raw_copy.copy()
         combined = np.hstack((cv2.resize(fox_image, (400, 400)), radar))
         ok, enc_combined = cv2.imencode(".jpg", combined)
-        ok_overlay, enc_overlay = cv2.imencode(".jpg", annotated_frame)
 
         with _frame_lock:
             if ok:
                 global foxglove_current_frame
                 foxglove_current_frame = enc_combined.tobytes()
+            _latest_raw_frame = raw_copy
             _latest_overlay_frame = annotated_frame
-            if ok_overlay:
-                _latest_overlay_jpeg = enc_overlay.tobytes()
             _vision_snapshot = snap
 
 
@@ -1297,9 +1280,15 @@ def _generate_mjpeg_from_buffer(overlay: bool):
         next_frame_time = max(next_frame_time + frame_interval, time.perf_counter())
 
         with _frame_lock:
-            frame_bytes = _latest_overlay_jpeg if overlay else _latest_raw_jpeg
-        if frame_bytes is None:
+            src = _latest_overlay_frame if overlay else _latest_raw_frame
+            if src is None:
+                continue
+            frame = src.copy()
+
+        ok, buffer = cv2.imencode(".jpg", frame)
+        if not ok:
             continue
+        frame_bytes = buffer.tobytes()
         yield (
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
@@ -1334,7 +1323,7 @@ def _open_first_available_camera(max_index: int = 3):
 def _ensure_pipeline_initialized():
     global cap, face_analysis, face_alignment, embeddings_db
     if face_analysis is None:
-        face_analysis = FaceAnalysis(min_detection_confidence=0.8, model_selection=0)
+        face_analysis = FaceAnalysis(min_detection_confidence=0.5, model_selection=0)
     if face_alignment is None:
         face_alignment = FaceAlignment(
             num_faces=2,
@@ -1353,8 +1342,6 @@ def _ensure_pipeline_initialized():
         cap, camera_idx = _open_first_available_camera(max_index=3)
         if cap is None:
             raise RuntimeError("Cannot open camera. Check camera permissions/device.")
-        # Keep camera buffer short to avoid stale frame lag.
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
         print(f"Using camera index: {camera_idx}")
 
@@ -1417,9 +1404,6 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
   const chatLog = document.getElementById('chatLog');
   const wsHint = document.getElementById('wsHint');
   let micStarted = false;
-  const minuteConversationBuffer = [];
-  let flushInProgress = false;
-  let currentDetectedUser = 'user_011';
 
   function logLine(role, text) {
     const d = document.createElement('div');
@@ -1430,211 +1414,25 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
     chatLog.scrollTop = chatLog.scrollHeight;
   }
 
-  function addConversationLine(role, text) {
-    const clean = String(text || '').trim();
-    if (!clean) return;
-    minuteConversationBuffer.push(role + ':' + clean);
-  }
-
-  function flushMinuteConversation(useBeacon) {
-    if (!minuteConversationBuffer.length) return;
-    if (flushInProgress && !useBeacon) return;
-
-    const payload = JSON.stringify({
-      messages: minuteConversationBuffer.slice(),
-      client_ts: new Date().toISOString()
-    });
-
-    if (useBeacon && navigator.sendBeacon) {
-      const blob = new Blob([payload], { type: 'application/json' });
-      const sent = navigator.sendBeacon('/api/conversation_minute', blob);
-      if (sent) minuteConversationBuffer.length = 0;
-      return;
-    }
-
-    flushInProgress = true;
-    fetch('/api/conversation_minute', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: payload,
-      keepalive: true
-    }).then(function(res) {
-      if (res.ok) minuteConversationBuffer.length = 0;
-    }).catch(function() {
-      // Keep buffer to retry on next interval.
-    }).finally(function() {
-      flushInProgress = false;
-    });
-  }
-
   const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = wsProto + '//' + location.host + '/ws/realtime';
-  const baseRealtimeInstructions = {{ base_instructions_json|safe }};
   let realtime = null;
-  let currentSessionInstructions = baseRealtimeInstructions;
-  let holdAssistantUntilUserTranscript = false;
-  const bufferedAssistantDeltas = [];
-  let assistantTurnEndPending = false;
-
-  function queueOrAppendAgentDelta(chunk) {
-    if (!chunk) return;
-    if (holdAssistantUntilUserTranscript) {
-      bufferedAssistantDeltas.push(chunk);
-    } else {
-      appendAgentDelta(chunk);
-    }
-  }
-  function flushBufferedAssistantDeltas() {
-    if (!bufferedAssistantDeltas.length) return;
-    const merged = bufferedAssistantDeltas.join('');
-    bufferedAssistantDeltas.length = 0;
-    appendAgentDelta(merged);
-  }
-  function releaseAssistantAfterUserTranscript() {
-    holdAssistantUntilUserTranscript = false;
-    flushBufferedAssistantDeltas();
-    if (assistantTurnEndPending) {
-      assistantTurnEndPending = false;
-      finishAgentTurn();
-    }
-  }
-
-  function refreshDetectedUser() {
-    fetch('/api/vision_state', { cache: 'no-store' }).then(function(res) {
-      if (!res.ok) return null;
-      return res.json();
-    }).then(function(data) {
-      if (!data || !Array.isArray(data.faces)) return;
-      for (let i = 0; i < data.faces.length; i++) {
-        const face = data.faces[i];
-        if (face && typeof face.user === 'string') {
-          const label = face.user.trim();
-          if (label) {
-            currentDetectedUser = label;
-            return;
-          }
-        }
-      }
-    }).catch(function() {
-      // Keep last known user label if API is temporarily unavailable.
-    });
-  }
 
   function appendAgentDelta(t) {
     let lastMsg = chatLog.querySelector('.msg-agent.last');
     if (!lastMsg) {
       lastMsg = document.createElement('div');
       lastMsg.className = 'message msg-agent last';
-      const roleEl = document.createElement('div');
-      roleEl.className = 'role';
-      roleEl.textContent = '[RealTimeClient]';
-      const textEl = document.createElement('div');
-      textEl.className = 'text';
-      lastMsg.appendChild(roleEl);
-      lastMsg.appendChild(textEl);
+      lastMsg.innerHTML = '<div class="role">[M141]</div><div class="text"></div>';
       chatLog.appendChild(lastMsg);
     }
     const textDiv = lastMsg.querySelector('.text');
     textDiv.textContent = (textDiv.textContent || '') + (t || '');
     chatLog.scrollTop = chatLog.scrollHeight;
   }
-  function appendUserDelta(userLabel, delta) {
-    if (!delta) return;
-    const label = String(userLabel || 'user_011').trim() || 'user_011';
-    let lastMsg = chatLog.querySelector('.msg-user.last');
-    if (!lastMsg) {
-      lastMsg = document.createElement('div');
-      lastMsg.className = 'message msg-user last';
-      const roleEl = document.createElement('div');
-      roleEl.className = 'role';
-      roleEl.textContent = '[' + label + ']';
-      const textEl = document.createElement('div');
-      textEl.className = 'text';
-      lastMsg.appendChild(roleEl);
-      lastMsg.appendChild(textEl);
-      chatLog.appendChild(lastMsg);
-    } else {
-      const roleEl = lastMsg.querySelector('.role');
-      if (roleEl) roleEl.textContent = '[' + label + ']';
-    }
-    const textDiv = lastMsg.querySelector('.text');
-    textDiv.textContent = (textDiv.textContent || '') + delta;
-    chatLog.scrollTop = chatLog.scrollHeight;
-  }
-  function appendUserTurnComplete(userLabel, text) {
-    const label = String(userLabel || 'user_011').trim() || 'user_011';
-    const clean = String(text || '').trim();
-    if (!clean) return;
-    const d = document.createElement('div');
-    d.className = 'message msg-user';
-    const roleEl = document.createElement('div');
-    roleEl.className = 'role';
-    roleEl.textContent = '[' + label + ']';
-    const textEl = document.createElement('div');
-    textEl.className = 'text';
-    textEl.textContent = clean;
-    d.appendChild(roleEl);
-    d.appendChild(textEl);
-    chatLog.appendChild(d);
-    chatLog.scrollTop = chatLog.scrollHeight;
-  }
-  function finalizeUserTurn(userLabel, transcript) {
-    const label = String(userLabel || 'user_011').trim() || 'user_011';
-    const clean = String(transcript || '').trim();
-    if (!clean) {
-      releaseAssistantAfterUserTranscript();
-      return;
-    }
-    let lastMsg = chatLog.querySelector('.msg-user.last');
-    if (lastMsg) {
-      const textDiv = lastMsg.querySelector('.text');
-      if (textDiv) textDiv.textContent = clean;
-      if (!lastMsg.dataset.savedTurn) {
-        addConversationLine(label, clean);
-        lastMsg.dataset.savedTurn = '1';
-      }
-      lastMsg.classList.remove('last');
-    } else {
-      appendUserTurnComplete(label, clean);
-      addConversationLine(label, clean);
-    }
-    chatLog.scrollTop = chatLog.scrollHeight;
-    releaseAssistantAfterUserTranscript();
-  }
   function finishAgentTurn() {
     const last = chatLog.querySelector('.msg-agent.last');
-    if (!last) return;
-    const textDiv = last.querySelector('.text');
-    if (textDiv && !last.dataset.savedTurn) {
-      addConversationLine('ai', textDiv.textContent || '');
-      last.dataset.savedTurn = '1';
-    }
-    last.classList.remove('last');
-  }
-
-  function fetchFactsInstructions(query) {
-    const q = (query || '').trim();
-    const url = '/api/facts_context' + (q ? ('?q=' + encodeURIComponent(q)) : '');
-    return fetch(url, { cache: 'no-store' }).then(function(res) {
-      if (!res.ok) return { instructions: baseRealtimeInstructions };
-      return res.json();
-    }).catch(function() {
-      return { instructions: baseRealtimeInstructions };
-    });
-  }
-
-  function sendSessionUpdate(extra) {
-    if (!realtime || realtime.readyState !== WebSocket.OPEN) return;
-    const session = Object.assign({
-      modalities: ['text', 'audio'],
-      instructions: currentSessionInstructions,
-      voice: 'alloy',
-      input_audio_format: 'pcm16',
-      output_audio_format: 'pcm16',
-      input_audio_transcription: { model: 'whisper-1', language: 'uk' },
-      turn_detection: { type: 'server_vad', create_response: true }
-    }, extra || {});
-    realtime.send(JSON.stringify({ type: 'session.update', session: session }));
+    if (last) last.classList.remove('last');
   }
 
   function connectRealtime() {
@@ -1646,10 +1444,17 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
     }
     realtime.addEventListener('open', function() {
       wsHint.textContent = 'Realtime: підключено';
-      fetchFactsInstructions('').then(function(data) {
-        currentSessionInstructions = data.instructions || baseRealtimeInstructions;
-        sendSessionUpdate();
-      });
+      realtime.send(JSON.stringify({
+        type: 'session.update',
+        session: {
+          modalities: ['text', 'audio'],
+          instructions: 'Ты дружелюбний ассистент.Запамятай, що ти є в першу чергу українським ассистентом і повинен відповідати українською мовою.Також ти повинен максимально відповідати та розмовлятиукраїнською мовою, як звичайна людина.',
+          voice: 'alloy',
+          input_audio_format: 'pcm16',
+          output_audio_format: 'pcm16',
+          turn_detection: { type: 'server_vad', create_response: true }
+        }
+      }));
     });
     realtime.addEventListener('message', function(ev) {
       let data = ev.data;
@@ -1657,35 +1462,14 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
       let o;
       try { o = JSON.parse(data); } catch (e) { return; }
       const t = o.type || '';
-      if (t === 'input_audio_buffer.speech_started') {
-        holdAssistantUntilUserTranscript = true;
-        assistantTurnEndPending = false;
-      } else if (t === 'response.audio_transcript.delta' && o.delta) {
-        queueOrAppendAgentDelta(o.delta);
+      if (t === 'response.audio_transcript.delta' && o.delta) {
+        appendAgentDelta(o.delta);
       } else if (t === 'response.text.delta' && o.delta) {
-        queueOrAppendAgentDelta(o.delta);
+        appendAgentDelta(o.delta);
       } else if (t === 'response.audio_transcript.done' || t === 'response.done') {
-        if (holdAssistantUntilUserTranscript) {
-          assistantTurnEndPending = true;
-        } else {
-          finishAgentTurn();
-        }
-      } else if (t === 'conversation.item.input_audio_transcription.delta' && o.delta) {
-        holdAssistantUntilUserTranscript = true;
-        appendUserDelta(currentDetectedUser, o.delta);
-      } else if (t === 'conversation.item.input_audio_transcription.completed') {
-        const tr = o.transcript != null ? String(o.transcript).trim() : '';
-        if (tr) {
-          fetchFactsInstructions(tr).then(function(data) {
-            currentSessionInstructions = data.instructions || baseRealtimeInstructions;
-            sendSessionUpdate({ instructions: currentSessionInstructions });
-          });
-          finalizeUserTurn(currentDetectedUser, o.transcript);
-        } else {
-          releaseAssistantAfterUserTranscript();
-        }
-      } else if (t === 'conversation.item.input_audio_transcription.failed') {
-        releaseAssistantAfterUserTranscript();
+        finishAgentTurn();
+      } else if (t === 'conversation.item.input_audio_transcription.completed' && o.transcript) {
+        logLine('You', o.transcript);
       } else if (t === 'error') {
         logLine('Sys', 'Ошибка: ' + JSON.stringify(o.error || o));
       }
@@ -1752,10 +1536,6 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
   }
 
   wsHint.textContent = 'Микрофон: запрашиваем доступ...';
-  refreshDetectedUser();
-  setInterval(refreshDetectedUser, 1000);
-  setInterval(function() { flushMinuteConversation(false); }, 60 * 1000);
-  window.addEventListener('beforeunload', function() { flushMinuteConversation(true); });
   startMic();
   connectRealtime();
 })();
@@ -1768,10 +1548,7 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
 #FLASK PORT VIEW
 @app.route("/")
 def index():
-    return render_template_string(
-        INDEX_HTML,
-        base_instructions_json=json.dumps(REALTIME_BASE_INSTRUCTIONS, ensure_ascii=False),
-    )
+    return render_template_string(INDEX_HTML)
 
 @app.route("/overlay")
 def overlay_index(): return '<html><body style="display:flex; justify-content:center; align-items:center; height:100vh; background:#111; margin:0;"><img src="/stream_overlay" style="max-height:100vh; max-width:100vw;"></body></html>'
@@ -1794,84 +1571,6 @@ def api_vision_state():
     with _frame_lock:
         snap = dict(_vision_snapshot)
     return Response(json.dumps(snap, ensure_ascii=False), mimetype="application/json; charset=utf-8")
-
-
-@app.route("/api/facts_context", methods=["GET"])
-def api_facts_context():
-    """Факты из embeddings.db для подсказок Realtime-ассистенту."""
-    query = (request.args.get("q") or "").strip()
-    facts = facts_for_query(query)
-    context = build_facts_instructions_block(query)
-    instructions = merge_realtime_instructions(query)
-    return Response(
-        json.dumps(
-            {
-                "ok": True,
-                "query": query,
-                "facts": facts,
-                "context": context,
-                "instructions": instructions,
-            },
-            ensure_ascii=False,
-        ),
-        mimetype="application/json; charset=utf-8",
-    )
-
-
-@app.route("/api/conversation_minute", methods=["POST"])
-def api_conversation_minute():
-    payload = request.get_json(silent=True) or {}
-    messages = payload.get("messages", [])
-    if not isinstance(messages, list):
-        return Response(
-            json.dumps({"ok": False, "error": "messages must be a list"}, ensure_ascii=False),
-            status=400,
-            mimetype="application/json; charset=utf-8",
-        )
-
-    normalized: List[str] = []
-    for msg in messages:
-        if isinstance(msg, str):
-            line = msg.strip()
-            if line:
-                normalized.append(line)
-
-    if not normalized:
-        return Response(
-            json.dumps({"ok": True, "saved": False, "reason": "empty"}, ensure_ascii=False),
-            mimetype="application/json; charset=utf-8",
-        )
-
-    CONVERSATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    filename = time.strftime("%H-%M-%d-%m.json", time.localtime())
-    path = CONVERSATION_LOG_DIR / filename
-
-    doc: Dict[str, Any] = {
-        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
-        "messages": [],
-    }
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(existing, dict):
-                doc = existing
-        except Exception:
-            pass
-    existing_messages = doc.get("messages", [])
-    if not isinstance(existing_messages, list):
-        existing_messages = []
-    existing_messages.extend(normalized)
-    doc["messages"] = existing_messages
-    doc["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
-
-    path.write_text(
-        json.dumps(doc, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return Response(
-        json.dumps({"ok": True, "saved": True, "file": filename, "count": len(normalized)}, ensure_ascii=False),
-        mimetype="application/json; charset=utf-8",
-    )
 
 
 @app.route("/stream")
@@ -1952,50 +1651,16 @@ try:
 
         url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
         holder: List[Any] = [None]
-        state: Dict[str, Any] = {"last_transcript": ""}
 
         def on_open(ws_app):
             holder[0] = ws_app
-            try:
-                instr = merge_realtime_instructions("")
-                ws_app.send(
-                    json.dumps(
-                        {"type": "session.update", "session": {"instructions": instr}},
-                        ensure_ascii=False,
-                    )
-                )
-            except Exception:
-                pass
 
         def on_message(_ws_app, message):
             try:
                 if isinstance(message, bytes):
-                    text = message.decode("utf-8", errors="replace")
+                    ws.send(message.decode("utf-8", errors="replace"))
                 else:
-                    text = message
-                try:
-                    obj = json.loads(text)
-                except json.JSONDecodeError:
-                    obj = None
-                if isinstance(obj, dict):
-                    t = obj.get("type") or ""
-                    if t == "conversation.item.input_audio_transcription.completed":
-                        tr = str(obj.get("transcript") or "").strip()
-                        if tr:
-                            state["last_transcript"] = tr
-                            oa_ws = holder[0]
-                            if oa_ws is not None:
-                                instr = merge_realtime_instructions(tr)
-                                oa_ws.send(
-                                    json.dumps(
-                                        {
-                                            "type": "session.update",
-                                            "session": {"instructions": instr},
-                                        },
-                                        ensure_ascii=False,
-                                    )
-                                )
-                ws.send(text if isinstance(message, str) else text)
+                    ws.send(message)
             except Exception:
                 pass
 
@@ -2039,17 +1704,6 @@ try:
                 data = ws.receive()
                 if data is None:
                     break
-                if isinstance(data, str):
-                    try:
-                        obj = json.loads(data)
-                        if obj.get("type") == "session.update" and isinstance(
-                            obj.get("session"), dict
-                        ):
-                            q = str(state.get("last_transcript") or "")
-                            obj["session"]["instructions"] = merge_realtime_instructions(q)
-                            data = json.dumps(obj, ensure_ascii=False)
-                    except json.JSONDecodeError:
-                        pass
                 oa.send(data)
         except Exception:
             pass
