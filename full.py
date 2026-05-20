@@ -1,6 +1,6 @@
 import cv2
 import mediapipe as mp
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, render_template_string, request
 from pathlib import Path
 from urllib.request import urlretrieve
 import json
@@ -10,6 +10,17 @@ import sqlite3
 import threading
 from typing import Any, Dict, List, Tuple, Optional, Set, Union
 import numpy as np
+
+try:
+    import serial
+except ImportError:
+    serial = None
+
+import math
+
+foxglove_current_frame = None
+latest_scan = [0] * 360
+
 try:
     import sounddevice as sd
 except Exception:  # pragma: no cover
@@ -502,94 +513,6 @@ class HeadPoseEstimator:
         cv2.line(frame_bgr, origin, tuple(proj[3]), (255, 0, 0), 3, cv2.LINE_AA)
 
 
-# Очі + райдужка (Face Landmarker, 478 точок): чи зіниці біля центру «вікна» ока.
-# Якщо дивиться в камеру, райдужка ≈ по центру між зовнішнім/внутрішнім кутом і між верхом/низом повіки.
-LEFT_IRIS_IDXS = (474, 475, 476, 477)
-RIGHT_IRIS_IDXS = (469, 470, 471, 472)
-# Ліве око: зовнішній кут, внутрішній; верх / низ (MediaPipe mesh)
-LEFT_EYE_OUTER, LEFT_EYE_INNER = 33, 133
-LEFT_EYE_TOP, LEFT_EYE_BOTTOM = 159, 145
-RIGHT_EYE_OUTER, RIGHT_EYE_INNER = 263, 362
-RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM = 386, 374
-
-# Допустиме відхилення нормалізованого параметра від 0.5 (серединa сегмента ока)
-EYE_GAZE_CENTER_TOLERANCE = 0.17
-
-
-def _mean_iris_xy(
-    lms: List[Tuple[float, float, float]], idxs: Tuple[int, ...]
-) -> Tuple[float, float]:
-    xs = [lms[i][0] for i in idxs]
-    ys = [lms[i][1] for i in idxs]
-    return float(sum(xs) / len(xs)), float(sum(ys) / len(ys))
-
-
-def _segment_param(
-    px: float,
-    py: float,
-    ax: float,
-    ay: float,
-    bx: float,
-    by: float,
-) -> float:
-    """Проєкція точки (px,py) на відрізок A→B; 0 = A, 1 = B (без clamp)."""
-    ex, ey = bx - ax, by - ay
-    denom = ex * ex + ey * ey
-    if denom < 1e-6:
-        return 0.5
-    return ((px - ax) * ex + (py - ay) * ey) / denom
-
-
-def compute_is_watching_from_eyes(
-    lms: List[Tuple[float, float, float]],
-) -> bool:
-    """
-    True, якщо за положенням райдужок обидва ока «дивляться» приблизно в камеру
-    (райдужка близько до центру ока по горизонталі та вертикалі).
-    Потрібні всі 478 лендмарків (райдужка увімкнена в FaceAlignment).
-    """
-    need = max(
-        max(LEFT_IRIS_IDXS),
-        max(RIGHT_IRIS_IDXS),
-        RIGHT_EYE_TOP,
-        RIGHT_EYE_BOTTOM,
-    )
-    if len(lms) <= need:
-        return False
-
-    lix, liy = _mean_iris_xy(lms, LEFT_IRIS_IDXS)
-    rix, riy = _mean_iris_xy(lms, RIGHT_IRIS_IDXS)
-
-    # Горизонталь: зовнішній → внутрішній кут
-    t_h_l = _segment_param(
-        lix, liy,
-        lms[LEFT_EYE_OUTER][0], lms[LEFT_EYE_OUTER][1],
-        lms[LEFT_EYE_INNER][0], lms[LEFT_EYE_INNER][1],
-    )
-    t_h_r = _segment_param(
-        rix, riy,
-        lms[RIGHT_EYE_OUTER][0], lms[RIGHT_EYE_OUTER][1],
-        lms[RIGHT_EYE_INNER][0], lms[RIGHT_EYE_INNER][1],
-    )
-    # Вертикаль: верх повіки → низ
-    t_v_l = _segment_param(
-        lix, liy,
-        lms[LEFT_EYE_TOP][0], lms[LEFT_EYE_TOP][1],
-        lms[LEFT_EYE_BOTTOM][0], lms[LEFT_EYE_BOTTOM][1],
-    )
-    t_v_r = _segment_param(
-        rix, riy,
-        lms[RIGHT_EYE_TOP][0], lms[RIGHT_EYE_TOP][1],
-        lms[RIGHT_EYE_BOTTOM][0], lms[RIGHT_EYE_BOTTOM][1],
-    )
-
-    th = EYE_GAZE_CENTER_TOLERANCE
-    for t in (t_h_l, t_h_r, t_v_l, t_v_r):
-        if abs(t - 0.5) > th:
-            return False
-    return True
-
-
 def _match_landmarks_to_detection(
     lms: List[Tuple[float, float, float]],
     detections: List[Tuple],
@@ -618,44 +541,11 @@ def _match_landmarks_to_detection(
     return pool[0][1]
 
 
-def draw_is_watching_next_to_face_label(
-    frame_bgr: np.ndarray,
-    xmin: int,
-    ymin: int,
-    confidence: float,
-    is_watching: bool,
-    user_name: Optional[str] = None,
-) -> None:
-    """Текст одразу після напису «Face 0.xx» (ті самі шрифт / масштаб, що в _draw_detection)."""
-    face_label = f"Face {confidence:.2f}"
-    label_y = max(20, ymin - 10)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.6
-    thickness = 2
-    (tw, _), _ = cv2.getTextSize(face_label, font, font_scale, thickness)
-    if user_name:
-        suffix = f"  {user_name} is_watching={is_watching}"
-    else:
-        suffix = f"  is_watching={is_watching}"
-    watch_color = (0, 255, 0) if is_watching else (80, 80, 255)
-    x_suffix = xmin + tw + 2
-    cv2.putText(
-        frame_bgr,
-        suffix,
-        (x_suffix, label_y),
-        font,
-        font_scale,
-        watch_color,
-        thickness,
-        cv2.LINE_AA,
-    )
-
-
 # ----------------------------
 # Простые "user embeddings"
 # ----------------------------
 
-EMBEDDING_DB_PATH = Path(__file__).resolve().parent / "embeddings.db"
+from embedding_db import CHAR_TABLE, EMBEDDING_DB_PATH, init_embedding_db, normalize_user_name
 
 # embedding считается как вектор по выровненному лицу.
 # Важно: это не нейросетевой face embedding (в репозитории нет модели),
@@ -678,6 +568,9 @@ EMBEDDING_EMA_MOMENTUM = 0.98
 VOICE_SAMPLE_SECONDS = 2.0
 VOICE_SAMPLE_RATE = 16000
 VOICE_EMBEDDING_DIM = 256
+
+# Новий невідомий користувач потрапляє в БД лише після стільки секунд безперервної присутності в кадрі.
+NEW_USER_MIN_VISIBLE_SEC = 2.0
 
 # InsightFace model init is heavy, so we create it lazily.
 _insightface_app = None
@@ -797,7 +690,7 @@ def _record_voice_embedding() -> Optional[np.ndarray]:
 
 
 class EmbeddingsDB:
-    """Хранит embedding’и пользователей в SQLite и выдаёт user_1, user_2, ..."""
+    """Хранит face/voice embedding’и в char_embeddings (user_001, user_002, ...)."""
 
     def __init__(
         self,
@@ -813,17 +706,7 @@ class EmbeddingsDB:
 
         with self._conn:
             self._conn.execute("PRAGMA journal_mode=WAL;")
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS embeddings (
-                    user_name TEXT PRIMARY KEY,
-                    face_embedding BLOB NOT NULL,
-                    voice_embedding BLOB,
-                    created_at REAL NOT NULL
-                )
-                """
-            )
-            self._ensure_schema_compatibility()
+            init_embedding_db(self._conn)
 
         # В памяти держим embedding на пользователя.
         self._known: Dict[str, np.ndarray] = {}
@@ -842,38 +725,16 @@ class EmbeddingsDB:
             )
         return vec
 
-    def _ensure_schema_compatibility(self) -> None:
-        """Мягкая миграция старой схемы (embedding -> face_embedding)."""
-        cols = self._conn.execute("PRAGMA table_info(embeddings)").fetchall()
-        col_names = {row[1] for row in cols}
-
-        if "face_embedding" not in col_names:
-            self._conn.execute("ALTER TABLE embeddings ADD COLUMN face_embedding BLOB")
-            if "embedding" in col_names:
-                self._conn.execute(
-                    "UPDATE embeddings SET face_embedding = embedding WHERE face_embedding IS NULL"
-                )
-
-        if "voice_embedding" not in col_names:
-            self._conn.execute("ALTER TABLE embeddings ADD COLUMN voice_embedding BLOB")
-
     def _load_known_embeddings(self) -> None:
         with self._lock, self._conn:
-            cols = self._conn.execute("PRAGMA table_info(embeddings)").fetchall()
-            col_names = {row[1] for row in cols}
-            if "face_embedding" in col_names:
-                rows = self._conn.execute(
-                    "SELECT user_name, face_embedding FROM embeddings"
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT user_name, embedding FROM embeddings"
-                ).fetchall()
+            rows = self._conn.execute(
+                f"SELECT user_name, face_embedding FROM {CHAR_TABLE}"
+            ).fetchall()
 
         known: Dict[str, np.ndarray] = {}
         for user_name, blob in rows:
             try:
-                known[user_name] = self._deserialize_embedding(blob)
+                known[normalize_user_name(user_name)] = self._deserialize_embedding(blob)
             except Exception:
                 continue
 
@@ -907,39 +768,27 @@ class EmbeddingsDB:
 
         return best_name, best_sim, second_name, second_sim
 
-    def get_or_create_user_name(
-        self, embedding_vec: np.ndarray, voice_embedding_vec: Optional[np.ndarray] = None
-    ) -> Tuple[str, bool]:
+    def match_known_user(self, embedding_vec: np.ndarray) -> Optional[str]:
+        """Повертає ім'я з БД, якщо схожість ≥ порога; інакше None (без створення нового)."""
         with self._lock:
             if not self._known:
-                user_name = f"user_{self._next_user_id}"
-                self._next_user_id += 1
-                self._known[user_name] = embedding_vec
-                with self._conn:
-                    self._conn.execute(
-                        "INSERT OR REPLACE INTO embeddings (user_name, face_embedding, voice_embedding, created_at) VALUES (?, ?, ?, ?)",
-                        (
-                            user_name,
-                            self._serialize_embedding(embedding_vec),
-                            self._serialize_embedding(voice_embedding_vec)
-                            if voice_embedding_vec is not None
-                            else None,
-                            time.time(),
-                        ),
-                    )
-                return user_name, True
-
-            best_name, best_sim, second_name, second_sim = self._get_best_two_matches(embedding_vec)
-            # Как в ultv1.py: достаточно лучшего совпадения выше порога.
+                return None
+            best_name, best_sim, _, _ = self._get_best_two_matches(embedding_vec)
             if best_name is not None and best_sim >= self._similarity_threshold:
-                return best_name, False
+                return best_name
+            return None
 
-            user_name = f"user_{self._next_user_id}"
+    def register_new_user(
+        self, embedding_vec: np.ndarray, voice_embedding_vec: Optional[np.ndarray] = None
+    ) -> str:
+        """Завжди додає нового user_N у БД та в _known."""
+        with self._lock:
+            user_name = f"user_{self._next_user_id:03d}"
             self._next_user_id += 1
             self._known[user_name] = embedding_vec
             with self._conn:
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO embeddings (user_name, face_embedding, voice_embedding, created_at) VALUES (?, ?, ?, ?)",
+                    f"INSERT OR REPLACE INTO {CHAR_TABLE} (user_name, face_embedding, voice_embedding, created_at) VALUES (?, ?, ?, ?)",
                     (
                         user_name,
                         self._serialize_embedding(embedding_vec),
@@ -949,13 +798,25 @@ class EmbeddingsDB:
                         time.time(),
                     ),
                 )
-            return user_name, True
+            return user_name
+
+    def get_or_create_user_name(
+        self, embedding_vec: np.ndarray, voice_embedding_vec: Optional[np.ndarray] = None
+    ) -> Tuple[str, bool]:
+        matched = self.match_known_user(embedding_vec)
+        if matched is not None:
+            return matched, False
+        user_name = self.register_new_user(embedding_vec, voice_embedding_vec)
+        return user_name, True
 
     def set_voice_embedding(self, user_name: str, voice_embedding_vec: np.ndarray) -> None:
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE embeddings SET voice_embedding = ? WHERE user_name = ?",
-                (self._serialize_embedding(voice_embedding_vec), user_name),
+                f"UPDATE {CHAR_TABLE} SET voice_embedding = ? WHERE user_name = ?",
+                (
+                    self._serialize_embedding(voice_embedding_vec),
+                    normalize_user_name(user_name),
+                ),
             )
 
     def close(self) -> None:
@@ -1033,7 +894,7 @@ def is_facing_camera_from_head_pose(
     max_roll: float = 35.0,
 ) -> bool:
     """
-    Додатково до погляду очима (is_watching): чи голова повернута до камери за кутами SolvePnP (крок 3 ТЗ).
+    Чи голова повернута до камери за кутами SolvePnP (крок 3 ТЗ).
     """
     return (
         abs(pitch) <= max_pitch
@@ -1081,7 +942,6 @@ def analyze_frame_full_pipeline(
                 "keypoints": keypoints,
                 "head_pose_deg": pose,
                 "is_facing_camera_head": facing_head,
-                "is_watching_eyes": compute_is_watching_from_eyes(lms),
                 "aligned_face_bgr": aligned,
                 "affine_2x3": affine,
             }
@@ -1094,24 +954,105 @@ def analyze_frame_full_pipeline(
     }
 
 
+def lidar_thread():
+    global latest_scan
+    if serial is None: return
+    BAUDRATE = 230400
+    port_candidates = ["/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyAMA10"]
+    ser = None
+    for p in port_candidates:
+        try:
+            print("Trying", p)
+            ser = serial.Serial(p, BAUDRATE, timeout=1)
+            print(f"LiDAR connected on {p}")
+            break
+        except: continue
+    if not ser: return
+    
+    buffer = bytearray()
+    scan_data = [0] * 360
+    last_angle = 0.0
+    while True:
+        try:
+            if ser.in_waiting:
+                buffer.extend(ser.read(ser.in_waiting))
+                while len(buffer) >= 47:
+                    if buffer[0] == 0x54 and buffer[1] == 0x2C:
+                        packet = buffer[:47]; del buffer[:47]
+                        start_angle = (packet[4] + packet[5] * 256) / 100.0
+                        if start_angle > 360: continue
+                        if start_angle < last_angle - 180:
+                            latest_scan = scan_data.copy()
+                            scan_data = [0] * 360
+                        for i in range(12):
+                            dist = packet[6 + i*3] + packet[7 + i*3] * 256
+                            if 50 < dist < 8000:
+                                scan_data[int((start_angle + i * 0.3) % 360)] = dist
+                        last_angle = start_angle
+                    else: del buffer[0:1]
+            time.sleep(0.01)
+        except: time.sleep(1)
+
+RADAR_MAX_DIST = 4000
+CAMERA_FOV = 60
+
+def draw_radar_map(scan, target_angle=None, target_dist=None):
+    size = 400
+    center = (size // 2, size // 2)
+    scale = (size / 2) / RADAR_MAX_DIST
+    radar_img = np.zeros((size, size, 3), dtype=np.uint8)
+    
+    for r in [1000, 2000, 3000, 4000]:
+        r_px = int(r * scale)
+        cv2.circle(radar_img, center, r_px, (40, 40, 40), 1)
+        
+    fov_half = CAMERA_FOV / 2.0
+    cv2.ellipse(radar_img, center, (int(RADAR_MAX_DIST*scale), int(RADAR_MAX_DIST*scale)),
+                -90, -fov_half, fov_half, (20, 20, 60), -1)
+                
+    cv2.line(radar_img, center, (center[0], 0), (0, 255, 0), 2)
+    
+    for angle in range(360):
+        try:
+            dist = scan[angle]
+            if 50 < dist < RADAR_MAX_DIST:
+                rad = math.radians(angle - 90)
+                x = int(center[0] + dist * scale * math.cos(rad))
+                y = int(center[1] + dist * scale * math.sin(rad))
+                cv2.circle(radar_img, (x, y), 2, (255, 255, 255), -1)
+        except:
+            continue
+            
+    if target_angle is not None and target_dist is not None and target_dist > 0:
+        rad = math.radians(target_angle - 90)
+        x = int(center[0] + target_dist * scale * math.cos(rad))
+        y = int(center[1] + target_dist * scale * math.sin(rad))
+    cv2.circle(radar_img, center, 8, (0, 255, 255), -1)
+    return radar_img
+
 app = Flask(__name__)
 
 cap = None
 face_analysis = None
 face_alignment = None
 head_pose = HeadPoseEstimator(refine=True)
-TARGET_FPS = 15
+TARGET_FPS = 5
 embeddings_db: Optional[EmbeddingsDB] = None
 
 # Shared camera: один worker пишет кадры и JSON-снимок; MJPEG-генераторы только читают.
 _frame_lock = threading.Lock()
 _latest_raw_frame: Optional[np.ndarray] = None
 _latest_overlay_frame: Optional[np.ndarray] = None
+_latest_raw_jpeg: Optional[bytes] = None
+_latest_overlay_jpeg: Optional[bytes] = None
 _vision_snapshot: Dict[str, Any] = {}
 _camera_worker_started = False
+# face_index -> perf_counter, коли вперше побачили обличчя без матчу в БД (очікуємо NEW_USER_MIN_VISIBLE_SEC).
+_pending_new_user_since: Dict[int, float] = {}
+CONVERSATION_LOG_DIR = Path(__file__).resolve().parent / "conversation_logs"
 
 OPENAI_REALTIME_MODEL = os.environ.get(
-    "OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17"
+    "OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview"
 )
 
 
@@ -1148,7 +1089,8 @@ def _start_camera_worker() -> None:
 
 
 def _camera_worker_loop() -> None:
-    global _latest_raw_frame, _latest_overlay_frame, _vision_snapshot
+    global _latest_raw_frame, _latest_overlay_frame, _latest_raw_jpeg, _latest_overlay_jpeg, _vision_snapshot
+    global _pending_new_user_since
     _ensure_pipeline_initialized()
     frame_interval = 1.0 / TARGET_FPS
     next_frame_time = time.perf_counter()
@@ -1164,6 +1106,13 @@ def _camera_worker_loop() -> None:
             continue
 
         raw_copy = frame.copy()
+        ok_raw, enc_raw = cv2.imencode(".jpg", raw_copy)
+        # Publish raw frame immediately to minimize stream latency.
+        with _frame_lock:
+            _latest_raw_frame = raw_copy
+            if ok_raw:
+                _latest_raw_jpeg = enc_raw.tobytes()
+
         annotated_frame, detections = face_analysis.process_frame(frame)
         faces_snapshots: List[Dict[str, Any]] = []
 
@@ -1196,22 +1145,28 @@ def _camera_worker_loop() -> None:
                     )
                     embedding_vec = _compute_embedding_from_aligned(aligned_for_embedding)
                     assert embeddings_db is not None
-                    assigned_user_name, is_new_user = embeddings_db.get_or_create_user_name(
-                        embedding_vec
-                    )
-                    if is_new_user:
-                        voice_embedding_vec = _record_voice_embedding()
-                        if voice_embedding_vec is not None:
-                            embeddings_db.set_voice_embedding(
-                                assigned_user_name, voice_embedding_vec
-                            )
-                            print(f"[voice] saved for {assigned_user_name}")
-                        print(f"[embeddings] created {assigned_user_name}")
+                    matched = embeddings_db.match_known_user(embedding_vec)
+                    if matched is not None:
+                        assigned_user_name = matched
+                        _pending_new_user_since.pop(fi, None)
+                    else:
+                        now_mono = time.perf_counter()
+                        if fi not in _pending_new_user_since:
+                            _pending_new_user_since[fi] = now_mono
+                        if now_mono - _pending_new_user_since[fi] >= NEW_USER_MIN_VISIBLE_SEC:
+                            assigned_user_name = embeddings_db.register_new_user(embedding_vec)
+                            _pending_new_user_since.pop(fi, None)
+                            voice_embedding_vec = _record_voice_embedding()
+                            if voice_embedding_vec is not None:
+                                embeddings_db.set_voice_embedding(
+                                    assigned_user_name, voice_embedding_vec
+                                )
+                                print(f"[voice] saved for {assigned_user_name}")
+                            print(f"[embeddings] created {assigned_user_name} (after {NEW_USER_MIN_VISIBLE_SEC:g}s in frame)")
                 except Exception as exc:
                     print(f"[embeddings] failed for face {fi}: {exc}")
 
                 est = head_pose.estimate(lms, frame.shape)
-                is_watching = compute_is_watching_from_eyes(lms)
                 facing_head: Optional[bool] = None
                 pitch = yaw = roll = None
 
@@ -1222,15 +1177,6 @@ def _camera_worker_loop() -> None:
                         )
                         if di is not None:
                             used_detection_indices.add(di)
-                            xmin, ymin, xmax, ymax, conf = detections[di]
-                            draw_is_watching_next_to_face_label(
-                                annotated_frame,
-                                int(xmin),
-                                int(ymin),
-                                float(conf),
-                                is_watching,
-                                user_name=assigned_user_name,
-                            )
                     faces_snapshots.append(
                         {
                             "face_index": fi,
@@ -1239,7 +1185,6 @@ def _camera_worker_loop() -> None:
                             "face_landmarker_keypoints": _serialize_keypoints_for_api(
                                 keypoints
                             ),
-                            "is_watching_eyes": is_watching,
                             "head_pose_deg": None,
                             "head_ok": None,
                         }
@@ -1255,21 +1200,12 @@ def _camera_worker_loop() -> None:
                     )
                     if di is not None:
                         used_detection_indices.add(di)
-                        xmin, ymin, xmax, ymax, conf = detections[di]
-                        draw_is_watching_next_to_face_label(
-                            annotated_frame,
-                            int(xmin),
-                            int(ymin),
-                            float(conf),
-                            is_watching,
-                            user_name=assigned_user_name,
-                        )
 
                 head_pose.draw_pose_axes(annotated_frame, rvec, tvec, length=120.0)
                 label = (
                     f"{assigned_user_name or 'unknown'} "
                     f"P:{pitch:+.0f} Y:{yaw:+.0f} R:{roll:+.0f} "
-                    f"eyes:{is_watching} head_ok:{facing_head}"
+                    f"head_ok:{facing_head}"
                 )
                 cv2.putText(
                     annotated_frame,
@@ -1290,7 +1226,6 @@ def _camera_worker_loop() -> None:
                         "face_landmarker_keypoints": _serialize_keypoints_for_api(
                             keypoints
                         ),
-                        "is_watching_eyes": is_watching,
                         "head_pose_deg": {
                             "pitch_deg": float(pitch),
                             "yaw_deg": float(yaw),
@@ -1299,6 +1234,10 @@ def _camera_worker_loop() -> None:
                         "head_ok": facing_head,
                     }
                 )
+            n_faces = len(faces_lms)
+            for _fi_pending in list(_pending_new_user_since.keys()):
+                if _fi_pending >= n_faces:
+                    del _pending_new_user_since[_fi_pending]
         except Exception as exc:
             print(f"[head_pose] {exc}")
 
@@ -1311,9 +1250,19 @@ def _camera_worker_loop() -> None:
             "faces": faces_snapshots,
         }
 
+        radar = draw_radar_map(latest_scan, target_angle=None)
+        fox_image = raw_copy.copy()
+        combined = np.hstack((cv2.resize(fox_image, (400, 400)), radar))
+        ok, enc_combined = cv2.imencode(".jpg", combined)
+        ok_overlay, enc_overlay = cv2.imencode(".jpg", annotated_frame)
+
         with _frame_lock:
-            _latest_raw_frame = raw_copy
+            if ok:
+                global foxglove_current_frame
+                foxglove_current_frame = enc_combined.tobytes()
             _latest_overlay_frame = annotated_frame
+            if ok_overlay:
+                _latest_overlay_jpeg = enc_overlay.tobytes()
             _vision_snapshot = snap
 
 
@@ -1328,15 +1277,9 @@ def _generate_mjpeg_from_buffer(overlay: bool):
         next_frame_time = max(next_frame_time + frame_interval, time.perf_counter())
 
         with _frame_lock:
-            src = _latest_overlay_frame if overlay else _latest_raw_frame
-            if src is None:
-                continue
-            frame = src.copy()
-
-        ok, buffer = cv2.imencode(".jpg", frame)
-        if not ok:
+            frame_bytes = _latest_overlay_jpeg if overlay else _latest_raw_jpeg
+        if frame_bytes is None:
             continue
-        frame_bytes = buffer.tobytes()
         yield (
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
@@ -1371,12 +1314,12 @@ def _open_first_available_camera(max_index: int = 3):
 def _ensure_pipeline_initialized():
     global cap, face_analysis, face_alignment, embeddings_db
     if face_analysis is None:
-        face_analysis = FaceAnalysis(min_detection_confidence=0.5, model_selection=0)
+        face_analysis = FaceAnalysis(min_detection_confidence=0.8, model_selection=0)
     if face_alignment is None:
         face_alignment = FaceAlignment(
             num_faces=2,
             min_face_detection_confidence=0.5,
-            include_iris=True,  # райдужки для is_watching по очах
+            include_iris=False,
         )
     if embeddings_db is None:
         w, h = EMBEDDING_OUTPUT_SIZE
@@ -1390,6 +1333,8 @@ def _ensure_pipeline_initialized():
         cap, camera_idx = _open_first_available_camera(max_index=3)
         if cap is None:
             raise RuntimeError("Cannot open camera. Check camera permissions/device.")
+        # Keep camera buffer short to avoid stale frame lag.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
         print(f"Using camera index: {camera_idx}")
 
@@ -1403,12 +1348,12 @@ INDEX_HTML = """<!doctype html>
 <style>
   * { box-sizing: border-box; }
   body { margin:0; background:#0d0f12; color:#e8eaed; font-family:Segoe UI, Roboto, Arial, sans-serif; min-height:100vh; }
-  .wrap { display:flex; flex-wrap:wrap; min-height:100vh; max-width:1400px; margin:0 auto; padding:12px; gap:16px; }
-  .left { flex:1 1 420px; display:flex; flex-direction:column; gap:10px; }
-  .right { flex:1 1 360px; min-width:280px; display:flex; flex-direction:column; gap:8px; }
+  .wrap { display:grid; grid-template-columns: 1.5fr 1fr; min-height:100vh; max-width:1800px; width:100%; margin:0 auto; padding:20px; gap:20px; }
+  .left { display:flex; flex-direction:column; gap:10px; }
+  .right { background: #0a0b10; border: 1px solid #111; padding: 20px; display: flex; flex-direction: column; border-radius: 8px; }
   h1 { font-size:1.1rem; margin:0 0 4px 0; font-weight:600; color:#9ad1ff; }
-  .video-box { background:#000; border:1px solid #2a3340; border-radius:8px; overflow:hidden; }
-  .video-box img { display:block; width:100%; height:auto; vertical-align:middle; }
+  .video-box { background:#000; border:1px solid #1a1f26; border-radius:8px; overflow:hidden; }
+  .video-box img { display:block; width:auto; height: 600px ; vertical-align:middle; object-fit:cover; }
   button.toggle { align-self:flex-start; padding:10px 16px; border-radius:8px; border:1px solid #3d4a5c; background:#1a2332; color:#e8eaed; cursor:pointer; font-size:0.95rem; }
   button.toggle:hover { background:#243044; }
 button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
@@ -1416,12 +1361,15 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
   .details.visible { display:flex; }
   .details pre { margin:0; padding:10px; background:#11161d; border:1px solid #2a3340; border-radius:8px; font-size:11px; line-height:1.35; max-height:220px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
   .details .ov { margin-top:4px; }
-  .chat-panel { flex:1; display:flex; flex-direction:column; min-height:320px; background:#11161d; border:1px solid #2a3340; border-radius:8px; overflow:hidden; }
-  .chat-panel h2 { margin:0; padding:10px 12px; font-size:0.95rem; border-bottom:1px solid #2a3340; background:#151b24; }
-  #chatLog { flex:1; overflow-y:auto; padding:12px; font-size:0.9rem; line-height:1.45; }
-  .msg-user { color:#7dd3fc; margin:6px 0; }
-  .msg-agent { color:#a7f3d0; margin:6px 0; }
-  .msg-sys { color:#94a3b8; font-size:0.85rem; margin:6px 0; }
+  .title-bar { border-bottom: 1px solid #008800; padding-bottom: 10px; margin-bottom: 15px; }
+  .title-bar h3 { margin: 0; font-size: 1.17em; color: #00ff00; text-transform: uppercase; font-family: sans-serif; }
+  .chat-box { flex-grow: 1; overflow-y: auto; padding-right: 10px; font-family: 'Courier New', monospace; min-height: 320px; }
+  .message { margin-bottom: 12px; border-bottom: 1px solid #111; padding-bottom: 8px; }
+  .role { font-weight: bold; color: #00ffaa; font-size: 0.9em; }
+  .text { color: #ccc; font-size: 0.95em; margin-top: 2px; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: #000; }
+  ::-webkit-scrollbar-thumb { background: #003300; }
   .hint { font-size:0.8rem; color:#64748b; padding:0 4px; }
 </style>
 </head>
@@ -1432,117 +1380,237 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
     <div class="video-box">
       <img src="/stream" alt="video"/>
     </div>
-    <button type="button" class="toggle" id="btnDetails">Показать детали анализа</button>
+    <div style="display: flex; justify-content: space-around; margin-top: 15px;">
+       <a href="/overlay" target="_blank" style="text-decoration:none; text-align:center; color:#5e35b1; font-weight:500;">Камера з даними</a>
+       <a href="/foxglove" target="_blank" style="text-decoration:none; text-align:center; color:#5e35b1; font-weight:500;">Foxglove SLAM</a>
+    </div>
     <p class="hint" id="wsHint"></p>
-    <div class="details" id="detailsPanel">
-      <pre id="visionJson">Загрузка…</pre>
-      <div class="video-box ov">
-        <img id="overlayImg" src="/stream_overlay" alt="overlay"/>
-      </div>
-    </div>
   </div>
-  <div class="right">
-    <div class="chat-panel">
-      <h2>Диалог (OpenAI Realtime)</h2>
-      <div id="chatLog"></div>
-    </div>
-    <button type="button" class="toggle" id="btnMic">Разрешить микрофон и начать разговор</button>
-    <p class="hint">Микрофон: разрешите доступ в браузере. Нужны переменные окружения OPENAI_API_KEY на сервере и пакеты flask-sock, websocket-client.</p>
+  <div class="right sidebar">
+    <div class="title-bar"><h3>ЛОГ_ДІАЛОГУ</h3></div>
+    <div id="chatLog" class="chat-box"></div>
+    
   </div>
 </div>
 <script>
 (function(){
-  const details = document.getElementById('detailsPanel');
-  const btn = document.getElementById('btnDetails');
-  const btnMic = document.getElementById('btnMic');
-  const visionJson = document.getElementById('visionJson');
   const chatLog = document.getElementById('chatLog');
   const wsHint = document.getElementById('wsHint');
-  let pollId = null;
-  let detailsOn = false;
   let micStarted = false;
-  let micPending = false;
+  const minuteConversationBuffer = [];
+  let flushInProgress = false;
+  let currentDetectedUser = 'user_011';
 
-  function logLine(cls, text) {
+  function logLine(role, text) {
     const d = document.createElement('div');
-    d.className = cls;
-    d.textContent = text;
+    d.className = 'message';
+    d.innerHTML = '<div class="role">[' + role + ']</div><div class="text"></div>';
+    d.querySelector('.text').textContent = text;
     chatLog.appendChild(d);
     chatLog.scrollTop = chatLog.scrollHeight;
   }
 
-  btn.addEventListener('click', function() {
-    detailsOn = !detailsOn;
-    details.classList.toggle('visible', detailsOn);
-    btn.textContent = detailsOn ? 'Скрыть детали анализа' : 'Показать детали анализа';
-    if (detailsOn) {
-      pollId = setInterval(function() {
-        fetch('/api/vision_state').then(function(r){ return r.json(); }).then(function(j){
-          visionJson.textContent = JSON.stringify(j, null, 2);
-        }).catch(function(){ visionJson.textContent = 'Ошибка /api/vision_state'; });
-      }, 250);
-    } else {
-      if (pollId) clearInterval(pollId);
-      pollId = null;
-    }
-  });
+  function addConversationLine(role, text) {
+    const clean = String(text || '').trim();
+    if (!clean) return;
+    minuteConversationBuffer.push(role + ':' + clean);
+  }
 
-  if (btnMic) {
-    btnMic.addEventListener('click', function() {
-      const isRealtimeOpen = !!realtime && realtime.readyState === WebSocket.OPEN;
-      micPending = !isRealtimeOpen;
-      wsHint.textContent = isRealtimeOpen
-        ? 'Микрофон: запрошен'
-        : 'Микрофон: запрошен, ждём подключение Realtime...';
-      startMic();
-      btnMic.disabled = true;
+  function flushMinuteConversation(useBeacon) {
+    if (!minuteConversationBuffer.length) return;
+    if (flushInProgress && !useBeacon) return;
+
+    const payload = JSON.stringify({
+      messages: minuteConversationBuffer.slice(),
+      client_ts: new Date().toISOString()
+    });
+
+    if (useBeacon && navigator.sendBeacon) {
+      const blob = new Blob([payload], { type: 'application/json' });
+      const sent = navigator.sendBeacon('/api/conversation_minute', blob);
+      if (sent) minuteConversationBuffer.length = 0;
+      return;
+    }
+
+    flushInProgress = true;
+    fetch('/api/conversation_minute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payload,
+      keepalive: true
+    }).then(function(res) {
+      if (res.ok) minuteConversationBuffer.length = 0;
+    }).catch(function() {
+      // Keep buffer to retry on next interval.
+    }).finally(function() {
+      flushInProgress = false;
     });
   }
 
   const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = wsProto + '//' + location.host + '/ws/realtime';
   let realtime = null;
+  let holdAssistantUntilUserTranscript = false;
+  const bufferedAssistantDeltas = [];
+  let assistantTurnEndPending = false;
+
+  function queueOrAppendAgentDelta(chunk) {
+    if (!chunk) return;
+    if (holdAssistantUntilUserTranscript) {
+      bufferedAssistantDeltas.push(chunk);
+    } else {
+      appendAgentDelta(chunk);
+    }
+  }
+  function flushBufferedAssistantDeltas() {
+    if (!bufferedAssistantDeltas.length) return;
+    const merged = bufferedAssistantDeltas.join('');
+    bufferedAssistantDeltas.length = 0;
+    appendAgentDelta(merged);
+  }
+  function releaseAssistantAfterUserTranscript() {
+    holdAssistantUntilUserTranscript = false;
+    flushBufferedAssistantDeltas();
+    if (assistantTurnEndPending) {
+      assistantTurnEndPending = false;
+      finishAgentTurn();
+    }
+  }
+
+  function refreshDetectedUser() {
+    fetch('/api/vision_state', { cache: 'no-store' }).then(function(res) {
+      if (!res.ok) return null;
+      return res.json();
+    }).then(function(data) {
+      if (!data || !Array.isArray(data.faces)) return;
+      for (let i = 0; i < data.faces.length; i++) {
+        const face = data.faces[i];
+        if (face && typeof face.user === 'string') {
+          const label = face.user.trim();
+          if (label) {
+            currentDetectedUser = label;
+            return;
+          }
+        }
+      }
+    }).catch(function() {
+      // Keep last known user label if API is temporarily unavailable.
+    });
+  }
 
   function appendAgentDelta(t) {
-    let last = chatLog.querySelector('.msg-agent.last');
-    if (!last) {
-      last = document.createElement('div');
-      last.className = 'msg-agent last';
-      chatLog.appendChild(last);
+    let lastMsg = chatLog.querySelector('.msg-agent.last');
+    if (!lastMsg) {
+      lastMsg = document.createElement('div');
+      lastMsg.className = 'message msg-agent last';
+      const roleEl = document.createElement('div');
+      roleEl.className = 'role';
+      roleEl.textContent = '[RealTimeClient]';
+      const textEl = document.createElement('div');
+      textEl.className = 'text';
+      lastMsg.appendChild(roleEl);
+      lastMsg.appendChild(textEl);
+      chatLog.appendChild(lastMsg);
     }
-    last.textContent = (last.textContent || '') + (t || '');
+    const textDiv = lastMsg.querySelector('.text');
+    textDiv.textContent = (textDiv.textContent || '') + (t || '');
     chatLog.scrollTop = chatLog.scrollHeight;
+  }
+  function appendUserDelta(userLabel, delta) {
+    if (!delta) return;
+    const label = String(userLabel || 'user_011').trim() || 'user_011';
+    let lastMsg = chatLog.querySelector('.msg-user.last');
+    if (!lastMsg) {
+      lastMsg = document.createElement('div');
+      lastMsg.className = 'message msg-user last';
+      const roleEl = document.createElement('div');
+      roleEl.className = 'role';
+      roleEl.textContent = '[' + label + ']';
+      const textEl = document.createElement('div');
+      textEl.className = 'text';
+      lastMsg.appendChild(roleEl);
+      lastMsg.appendChild(textEl);
+      chatLog.appendChild(lastMsg);
+    } else {
+      const roleEl = lastMsg.querySelector('.role');
+      if (roleEl) roleEl.textContent = '[' + label + ']';
+    }
+    const textDiv = lastMsg.querySelector('.text');
+    textDiv.textContent = (textDiv.textContent || '') + delta;
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+  function appendUserTurnComplete(userLabel, text) {
+    const label = String(userLabel || 'user_011').trim() || 'user_011';
+    const clean = String(text || '').trim();
+    if (!clean) return;
+    const d = document.createElement('div');
+    d.className = 'message msg-user';
+    const roleEl = document.createElement('div');
+    roleEl.className = 'role';
+    roleEl.textContent = '[' + label + ']';
+    const textEl = document.createElement('div');
+    textEl.className = 'text';
+    textEl.textContent = clean;
+    d.appendChild(roleEl);
+    d.appendChild(textEl);
+    chatLog.appendChild(d);
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+  function finalizeUserTurn(userLabel, transcript) {
+    const label = String(userLabel || 'user_011').trim() || 'user_011';
+    const clean = String(transcript || '').trim();
+    if (!clean) {
+      releaseAssistantAfterUserTranscript();
+      return;
+    }
+    let lastMsg = chatLog.querySelector('.msg-user.last');
+    if (lastMsg) {
+      const textDiv = lastMsg.querySelector('.text');
+      if (textDiv) textDiv.textContent = clean;
+      if (!lastMsg.dataset.savedTurn) {
+        addConversationLine(label, clean);
+        lastMsg.dataset.savedTurn = '1';
+      }
+      lastMsg.classList.remove('last');
+    } else {
+      appendUserTurnComplete(label, clean);
+      addConversationLine(label, clean);
+    }
+    chatLog.scrollTop = chatLog.scrollHeight;
+    releaseAssistantAfterUserTranscript();
   }
   function finishAgentTurn() {
     const last = chatLog.querySelector('.msg-agent.last');
-    if (last) last.classList.remove('last');
+    if (!last) return;
+    const textDiv = last.querySelector('.text');
+    if (textDiv && !last.dataset.savedTurn) {
+      addConversationLine('ai', textDiv.textContent || '');
+      last.dataset.savedTurn = '1';
+    }
+    last.classList.remove('last');
   }
 
   function connectRealtime() {
     try {
       realtime = new WebSocket(wsUrl);
     } catch (e) {
-      wsHint.textContent = 'WebSocket недоступен: ' + e;
+      wsHint.textContent = 'WebSocket недоступний: ' + e;
       return;
     }
     realtime.addEventListener('open', function() {
-      wsHint.textContent = 'Realtime: подключено';
+      wsHint.textContent = 'Realtime: підключено';
       realtime.send(JSON.stringify({
         type: 'session.update',
         session: {
           modalities: ['text', 'audio'],
-          instructions: 'Ты дружелюбный ассистент. Отвечай кратко по-русски, если пользователь говорит по-русски.',
+          instructions: 'Ты дружелюбний ассистент.Запамятай, що ти є в першу чергу українським ассистентом і повинен відповідати українською мовою.Також ти повинен максимально відповідати та розмовлятиукраїнською мовою, як звичайна людина.',
           voice: 'alloy',
           input_audio_format: 'pcm16',
           output_audio_format: 'pcm16',
+          input_audio_transcription: { model: 'whisper-1', language: 'uk' },
           turn_detection: { type: 'server_vad', create_response: true }
         }
       }));
-      if (micPending) {
-        startMic();
-        if (btnMic) btnMic.disabled = true;
-        micPending = false;
-      }
     });
     realtime.addEventListener('message', function(ev) {
       let data = ev.data;
@@ -1550,20 +1618,37 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
       let o;
       try { o = JSON.parse(data); } catch (e) { return; }
       const t = o.type || '';
-      if (t === 'response.audio_transcript.delta' && o.delta) {
-        appendAgentDelta(o.delta);
+      if (t === 'input_audio_buffer.speech_started') {
+        holdAssistantUntilUserTranscript = true;
+        assistantTurnEndPending = false;
+      } else if (t === 'response.audio_transcript.delta' && o.delta) {
+        queueOrAppendAgentDelta(o.delta);
       } else if (t === 'response.text.delta' && o.delta) {
-        appendAgentDelta(o.delta);
+        queueOrAppendAgentDelta(o.delta);
       } else if (t === 'response.audio_transcript.done' || t === 'response.done') {
-        finishAgentTurn();
-      } else if (t === 'conversation.item.input_audio_transcription.completed' && o.transcript) {
-        logLine('msg-user', 'Вы: ' + o.transcript);
+        if (holdAssistantUntilUserTranscript) {
+          assistantTurnEndPending = true;
+        } else {
+          finishAgentTurn();
+        }
+      } else if (t === 'conversation.item.input_audio_transcription.delta' && o.delta) {
+        holdAssistantUntilUserTranscript = true;
+        appendUserDelta(currentDetectedUser, o.delta);
+      } else if (t === 'conversation.item.input_audio_transcription.completed') {
+        const tr = o.transcript != null ? String(o.transcript).trim() : '';
+        if (tr) {
+          finalizeUserTurn(currentDetectedUser, o.transcript);
+        } else {
+          releaseAssistantAfterUserTranscript();
+        }
+      } else if (t === 'conversation.item.input_audio_transcription.failed') {
+        releaseAssistantAfterUserTranscript();
       } else if (t === 'error') {
-        logLine('msg-sys', 'Ошибка: ' + JSON.stringify(o.error || o));
+        logLine('Sys', 'Ошибка: ' + JSON.stringify(o.error || o));
       }
     });
     realtime.addEventListener('close', function() {
-      wsHint.textContent = 'Realtime: соединение закрыто';
+      wsHint.textContent = 'Realtime: не підключено';
     });
     realtime.addEventListener('error', function() {
       wsHint.textContent = 'Realtime: ошибка WebSocket (проверьте OPENAI_API_KEY и pip install flask-sock websocket-client)';
@@ -1623,6 +1708,12 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
     });
   }
 
+  wsHint.textContent = 'Микрофон: запрашиваем доступ...';
+  refreshDetectedUser();
+  setInterval(refreshDetectedUser, 1000);
+  setInterval(function() { flushMinuteConversation(false); }, 60 * 1000);
+  window.addEventListener('beforeunload', function() { flushMinuteConversation(true); });
+  startMic();
   connectRealtime();
 })();
 </script>
@@ -1636,12 +1727,83 @@ button.toggle:disabled { opacity: 0.55; cursor: not-allowed; }
 def index():
     return render_template_string(INDEX_HTML)
 
+@app.route("/overlay")
+def overlay_index(): return '<html><body style="display:flex; justify-content:center; align-items:center; height:100vh; background:#111; margin:0;"><img src="/stream_overlay" style="max-height:100vh; max-width:100vw;"></body></html>'
+
+@app.route("/foxglove")
+def foxglove_index(): return '<html><body style="display:flex; justify-content:center; align-items:center; height:100vh; background:#111; margin:0;"><img src="/foxglove/video_feed" style="max-height:100vh; max-width:100vw;"></body></html>'
+
+@app.route("/foxglove/video_feed")
+def foxglove_video_feed():
+    def gen():
+        while True:
+            if foxglove_current_frame:
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + foxglove_current_frame + b'\r\n')
+            time.sleep(0.1)
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
 
 @app.route("/api/vision_state")
 def api_vision_state():
     with _frame_lock:
         snap = dict(_vision_snapshot)
     return Response(json.dumps(snap, ensure_ascii=False), mimetype="application/json; charset=utf-8")
+
+
+@app.route("/api/conversation_minute", methods=["POST"])
+def api_conversation_minute():
+    payload = request.get_json(silent=True) or {}
+    messages = payload.get("messages", [])
+    if not isinstance(messages, list):
+        return Response(
+            json.dumps({"ok": False, "error": "messages must be a list"}, ensure_ascii=False),
+            status=400,
+            mimetype="application/json; charset=utf-8",
+        )
+
+    normalized: List[str] = []
+    for msg in messages:
+        if isinstance(msg, str):
+            line = msg.strip()
+            if line:
+                normalized.append(line)
+
+    if not normalized:
+        return Response(
+            json.dumps({"ok": True, "saved": False, "reason": "empty"}, ensure_ascii=False),
+            mimetype="application/json; charset=utf-8",
+        )
+
+    CONVERSATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    filename = time.strftime("%H-%M-%d-%m.json", time.localtime())
+    path = CONVERSATION_LOG_DIR / filename
+
+    doc: Dict[str, Any] = {
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "messages": [],
+    }
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                doc = existing
+        except Exception:
+            pass
+    existing_messages = doc.get("messages", [])
+    if not isinstance(existing_messages, list):
+        existing_messages = []
+    existing_messages.extend(normalized)
+    doc["messages"] = existing_messages
+    doc["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+
+    path.write_text(
+        json.dumps(doc, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return Response(
+        json.dumps({"ok": True, "saved": True, "file": filename, "count": len(normalized)}, ensure_ascii=False),
+        mimetype="application/json; charset=utf-8",
+    )
 
 
 @app.route("/stream")
@@ -1788,6 +1950,7 @@ except ImportError:
 
 
 if __name__ == "__main__":
+    threading.Thread(target=lidar_thread, daemon=True).start()
     try:
         app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
     finally:

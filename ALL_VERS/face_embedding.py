@@ -466,94 +466,6 @@ class HeadPoseEstimator:
         cv2.line(frame_bgr, origin, tuple(proj[3]), (255, 0, 0), 3, cv2.LINE_AA)
 
 
-# Очі + райдужка (Face Landmarker, 478 точок): чи зіниці біля центру «вікна» ока.
-# Якщо дивиться в камеру, райдужка ≈ по центру між зовнішнім/внутрішнім кутом і між верхом/низом повіки.
-LEFT_IRIS_IDXS = (474, 475, 476, 477)
-RIGHT_IRIS_IDXS = (469, 470, 471, 472)
-# Ліве око: зовнішній кут, внутрішній; верх / низ (MediaPipe mesh)
-LEFT_EYE_OUTER, LEFT_EYE_INNER = 33, 133
-LEFT_EYE_TOP, LEFT_EYE_BOTTOM = 159, 145
-RIGHT_EYE_OUTER, RIGHT_EYE_INNER = 263, 362
-RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM = 386, 374
-
-# Допустиме відхилення нормалізованого параметра від 0.5 (серединa сегмента ока)
-EYE_GAZE_CENTER_TOLERANCE = 0.17
-
-
-def _mean_iris_xy(
-    lms: List[Tuple[float, float, float]], idxs: Tuple[int, ...]
-) -> Tuple[float, float]:
-    xs = [lms[i][0] for i in idxs]
-    ys = [lms[i][1] for i in idxs]
-    return float(sum(xs) / len(xs)), float(sum(ys) / len(ys))
-
-
-def _segment_param(
-    px: float,
-    py: float,
-    ax: float,
-    ay: float,
-    bx: float,
-    by: float,
-) -> float:
-    """Проєкція точки (px,py) на відрізок A→B; 0 = A, 1 = B (без clamp)."""
-    ex, ey = bx - ax, by - ay
-    denom = ex * ex + ey * ey
-    if denom < 1e-6:
-        return 0.5
-    return ((px - ax) * ex + (py - ay) * ey) / denom
-
-
-def compute_is_watching_from_eyes(
-    lms: List[Tuple[float, float, float]],
-) -> bool:
-    """
-    True, якщо за положенням райдужок обидва ока «дивляться» приблизно в камеру
-    (райдужка близько до центру ока по горизонталі та вертикалі).
-    Потрібні всі 478 лендмарків (райдужка увімкнена в FaceAlignment).
-    """
-    need = max(
-        max(LEFT_IRIS_IDXS),
-        max(RIGHT_IRIS_IDXS),
-        RIGHT_EYE_TOP,
-        RIGHT_EYE_BOTTOM,
-    )
-    if len(lms) <= need:
-        return False
-
-    lix, liy = _mean_iris_xy(lms, LEFT_IRIS_IDXS)
-    rix, riy = _mean_iris_xy(lms, RIGHT_IRIS_IDXS)
-
-    # Горизонталь: зовнішній → внутрішній кут
-    t_h_l = _segment_param(
-        lix, liy,
-        lms[LEFT_EYE_OUTER][0], lms[LEFT_EYE_OUTER][1],
-        lms[LEFT_EYE_INNER][0], lms[LEFT_EYE_INNER][1],
-    )
-    t_h_r = _segment_param(
-        rix, riy,
-        lms[RIGHT_EYE_OUTER][0], lms[RIGHT_EYE_OUTER][1],
-        lms[RIGHT_EYE_INNER][0], lms[RIGHT_EYE_INNER][1],
-    )
-    # Вертикаль: верх повіки → низ
-    t_v_l = _segment_param(
-        lix, liy,
-        lms[LEFT_EYE_TOP][0], lms[LEFT_EYE_TOP][1],
-        lms[LEFT_EYE_BOTTOM][0], lms[LEFT_EYE_BOTTOM][1],
-    )
-    t_v_r = _segment_param(
-        rix, riy,
-        lms[RIGHT_EYE_TOP][0], lms[RIGHT_EYE_TOP][1],
-        lms[RIGHT_EYE_BOTTOM][0], lms[RIGHT_EYE_BOTTOM][1],
-    )
-
-    th = EYE_GAZE_CENTER_TOLERANCE
-    for t in (t_h_l, t_h_r, t_v_l, t_v_r):
-        if abs(t - 0.5) > th:
-            return False
-    return True
-
-
 def _match_landmarks_to_detection(
     lms: List[Tuple[float, float, float]],
     detections: List[Tuple],
@@ -582,44 +494,11 @@ def _match_landmarks_to_detection(
     return pool[0][1]
 
 
-def draw_is_watching_next_to_face_label(
-    frame_bgr: np.ndarray,
-    xmin: int,
-    ymin: int,
-    confidence: float,
-    is_watching: bool,
-    user_name: Optional[str] = None,
-) -> None:
-    """Текст одразу після напису «Face 0.xx» (ті самі шрифт / масштаб, що в _draw_detection)."""
-    face_label = f"Face {confidence:.2f}"
-    label_y = max(20, ymin - 10)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.6
-    thickness = 2
-    (tw, _), _ = cv2.getTextSize(face_label, font, font_scale, thickness)
-    if user_name:
-        suffix = f"  {user_name} is_watching={is_watching}"
-    else:
-        suffix = f"  is_watching={is_watching}"
-    watch_color = (0, 255, 0) if is_watching else (80, 80, 255)
-    x_suffix = xmin + tw + 2
-    cv2.putText(
-        frame_bgr,
-        suffix,
-        (x_suffix, label_y),
-        font,
-        font_scale,
-        watch_color,
-        thickness,
-        cv2.LINE_AA,
-    )
-
-
 # ----------------------------
 # Простые "user embeddings"
 # ----------------------------
 
-EMBEDDING_DB_PATH = Path(__file__).resolve().parent / "embeddings.db"
+from embedding_db import CHAR_TABLE, EMBEDDING_DB_PATH, init_embedding_db, normalize_user_name
 
 # embedding считается как вектор по выровненному лицу.
 # Важно: это не нейросетевой face embedding (в репозитории нет модели),
@@ -761,7 +640,7 @@ def _record_voice_embedding() -> Optional[np.ndarray]:
 
 
 class EmbeddingsDB:
-    """Хранит embedding’и пользователей в SQLite и выдаёт user_1, user_2, ..."""
+    """Хранит face/voice embedding’и в char_embeddings (user_001, user_002, ...)."""
 
     def __init__(
         self,
@@ -777,17 +656,7 @@ class EmbeddingsDB:
 
         with self._conn:
             self._conn.execute("PRAGMA journal_mode=WAL;")
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS embeddings (
-                    user_name TEXT PRIMARY KEY,
-                    face_embedding BLOB NOT NULL,
-                    voice_embedding BLOB,
-                    created_at REAL NOT NULL
-                )
-                """
-            )
-            self._ensure_schema_compatibility()
+            init_embedding_db(self._conn)
 
         # В памяти держим embedding на пользователя.
         self._known: Dict[str, np.ndarray] = {}
@@ -806,38 +675,16 @@ class EmbeddingsDB:
             )
         return vec
 
-    def _ensure_schema_compatibility(self) -> None:
-        """Мягкая миграция старой схемы (embedding -> face_embedding)."""
-        cols = self._conn.execute("PRAGMA table_info(embeddings)").fetchall()
-        col_names = {row[1] for row in cols}
-
-        if "face_embedding" not in col_names:
-            self._conn.execute("ALTER TABLE embeddings ADD COLUMN face_embedding BLOB")
-            if "embedding" in col_names:
-                self._conn.execute(
-                    "UPDATE embeddings SET face_embedding = embedding WHERE face_embedding IS NULL"
-                )
-
-        if "voice_embedding" not in col_names:
-            self._conn.execute("ALTER TABLE embeddings ADD COLUMN voice_embedding BLOB")
-
     def _load_known_embeddings(self) -> None:
         with self._lock, self._conn:
-            cols = self._conn.execute("PRAGMA table_info(embeddings)").fetchall()
-            col_names = {row[1] for row in cols}
-            if "face_embedding" in col_names:
-                rows = self._conn.execute(
-                    "SELECT user_name, face_embedding FROM embeddings"
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT user_name, embedding FROM embeddings"
-                ).fetchall()
+            rows = self._conn.execute(
+                f"SELECT user_name, face_embedding FROM {CHAR_TABLE}"
+            ).fetchall()
 
         known: Dict[str, np.ndarray] = {}
         for user_name, blob in rows:
             try:
-                known[user_name] = self._deserialize_embedding(blob)
+                known[normalize_user_name(user_name)] = self._deserialize_embedding(blob)
             except Exception:
                 continue
 
@@ -876,12 +723,12 @@ class EmbeddingsDB:
     ) -> Tuple[str, bool]:
         with self._lock:
             if not self._known:
-                user_name = f"user_{self._next_user_id}"
+                user_name = f"user_{self._next_user_id:03d}"
                 self._next_user_id += 1
                 self._known[user_name] = embedding_vec
                 with self._conn:
                     self._conn.execute(
-                        "INSERT OR REPLACE INTO embeddings (user_name, face_embedding, voice_embedding, created_at) VALUES (?, ?, ?, ?)",
+                        f"INSERT OR REPLACE INTO {CHAR_TABLE} (user_name, face_embedding, voice_embedding, created_at) VALUES (?, ?, ?, ?)",
                         (
                             user_name,
                             self._serialize_embedding(embedding_vec),
@@ -898,12 +745,12 @@ class EmbeddingsDB:
             if best_name is not None and best_sim >= self._similarity_threshold:
                 return best_name, False
 
-            user_name = f"user_{self._next_user_id}"
+            user_name = f"user_{self._next_user_id:03d}"
             self._next_user_id += 1
             self._known[user_name] = embedding_vec
             with self._conn:
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO embeddings (user_name, face_embedding, voice_embedding, created_at) VALUES (?, ?, ?, ?)",
+                    f"INSERT OR REPLACE INTO {CHAR_TABLE} (user_name, face_embedding, voice_embedding, created_at) VALUES (?, ?, ?, ?)",
                     (
                         user_name,
                         self._serialize_embedding(embedding_vec),
@@ -918,8 +765,11 @@ class EmbeddingsDB:
     def set_voice_embedding(self, user_name: str, voice_embedding_vec: np.ndarray) -> None:
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE embeddings SET voice_embedding = ? WHERE user_name = ?",
-                (self._serialize_embedding(voice_embedding_vec), user_name),
+                f"UPDATE {CHAR_TABLE} SET voice_embedding = ? WHERE user_name = ?",
+                (
+                    self._serialize_embedding(voice_embedding_vec),
+                    normalize_user_name(user_name),
+                ),
             )
 
     def close(self) -> None:
@@ -997,7 +847,7 @@ def is_facing_camera_from_head_pose(
     max_roll: float = 35.0,
 ) -> bool:
     """
-    Додатково до погляду очима (is_watching): чи голова повернута до камери за кутами SolvePnP (крок 3 ТЗ).
+    Чи голова повернута до камери за кутами SolvePnP (крок 3 ТЗ).
     """
     return (
         abs(pitch) <= max_pitch
@@ -1045,7 +895,6 @@ def analyze_frame_full_pipeline(
                 "keypoints": keypoints,
                 "head_pose_deg": pose,
                 "is_facing_camera_head": facing_head,
-                "is_watching_eyes": compute_is_watching_from_eyes(lms),
                 "aligned_face_bgr": aligned,
                 "affine_2x3": affine,
             }
@@ -1088,7 +937,7 @@ def _ensure_pipeline_initialized():
         face_alignment = FaceAlignment(
             num_faces=2,
             min_face_detection_confidence=0.5,
-            include_iris=True,  # райдужки для is_watching по очах
+            include_iris=False,
         )
     if embeddings_db is None:
         w, h = EMBEDDING_OUTPUT_SIZE
@@ -1165,7 +1014,6 @@ def generate_mjpeg_stream():
                     print(f"[embeddings] failed for face {fi}: {exc}")
 
                 est = head_pose.estimate(lms, frame.shape)
-                is_watching = compute_is_watching_from_eyes(lms)
                 facing_head: Optional[bool] = None
 
                 if est is None:
@@ -1175,15 +1023,6 @@ def generate_mjpeg_stream():
                         )
                         if di is not None:
                             used_detection_indices.add(di)
-                            xmin, ymin, xmax, ymax, conf = detections[di]
-                            draw_is_watching_next_to_face_label(
-                                annotated_frame,
-                                int(xmin),
-                                int(ymin),
-                                float(conf),
-                                is_watching,
-                                user_name=assigned_user_name,
-                            )
                     continue
 
                 pitch, yaw, roll, rvec, tvec = est
@@ -1195,21 +1034,12 @@ def generate_mjpeg_stream():
                     )
                     if di is not None:
                         used_detection_indices.add(di)
-                        xmin, ymin, xmax, ymax, conf = detections[di]
-                        draw_is_watching_next_to_face_label(
-                            annotated_frame,
-                            int(xmin),
-                            int(ymin),
-                            float(conf),
-                            is_watching,
-                            user_name=assigned_user_name,
-                        )
 
                 head_pose.draw_pose_axes(annotated_frame, rvec, tvec, length=120.0)
                 label = (
                     f"{assigned_user_name or 'unknown'} "
                     f"P:{pitch:+.0f} Y:{yaw:+.0f} R:{roll:+.0f} "
-                    f"eyes:{is_watching} head_ok:{facing_head}"
+                    f"head_ok:{facing_head}"
                 )
                 cv2.putText(
                     annotated_frame,
@@ -1223,7 +1053,7 @@ def generate_mjpeg_stream():
                 )
                 print(
                     f"[pipeline face {fi}] P={pitch:.1f} Y={yaw:.1f} R={roll:.1f} "
-                    f"is_watching_eyes={is_watching} facing_head={facing_head} user={assigned_user_name}"
+                    f"facing_head={facing_head} user={assigned_user_name}"
                 )
         except Exception as exc:
             print(f"[head_pose] {exc}")
